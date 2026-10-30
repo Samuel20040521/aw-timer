@@ -53,7 +53,19 @@ All tracking data stays on your Mac. No account, no cloud.
    open -a ActivityWatch
    ```
 
-2. Download the latest release and run the installer:
+2. Install aw-timer with **Homebrew** (builds from source; Homebrew installs Rust for the build if needed):
+
+   ```bash
+   brew tap samuel20040521/tap && brew trust samuel20040521/tap
+   ```
+
+   ```bash
+   brew install aw-timer && brew services start aw-timer
+   ```
+
+   `brew services` starts aw-timer now and at every login. Update with `brew upgrade aw-timer`; remove with `brew services stop aw-timer && brew uninstall aw-timer`.
+
+   **Or** download the prebuilt release and run the installer:
 
    ```bash
    curl -L -o aw-timer.tar.gz https://github.com/Samuel20040521/aw-timer/releases/latest/download/aw-timer-macos-universal.tar.gz

@@ -51,7 +51,19 @@
    open -a ActivityWatch
    ```
 
-2. 下載最新版並執行安裝程式：
+2. 用 **Homebrew** 安裝 aw-timer（從原始碼編譯，需要時 Homebrew 會自動安裝 Rust）：
+
+   ```bash
+   brew tap samuel20040521/tap && brew trust samuel20040521/tap
+   ```
+
+   ```bash
+   brew install aw-timer && brew services start aw-timer
+   ```
+
+   `brew services` 會立刻啟動 aw-timer，並在每次登入時自動啟動。更新用 `brew upgrade aw-timer`；移除用 `brew services stop aw-timer && brew uninstall aw-timer`。
+
+   **或者**下載編譯好的版本並執行安裝程式：
 
    ```bash
    curl -L -o aw-timer.tar.gz https://github.com/Samuel20040521/aw-timer/releases/latest/download/aw-timer-macos-universal.tar.gz

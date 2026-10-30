@@ -22,6 +22,7 @@ use std::time::SystemTime;
 use client::AwClient;
 
 const LAUNCHD_LABEL: &str = "local.aw-timer";
+const BREW_LABEL: &str = "homebrew.mxcl.aw-timer";
 
 const USAGE: &str = "\
 用法：aw-timer [--config 路徑] <指令>
@@ -70,11 +71,14 @@ fn main() -> ExitCode {
         "restart" => {
             // SAFETY: getuid has no preconditions and cannot fail.
             let uid = unsafe { libc_getuid() };
-            let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
-            let ok = Command::new("launchctl")
-                .args(["kickstart", "-k", &target])
-                .status()
-                .is_ok_and(|s| s.success());
+            // install.sh registers LAUNCHD_LABEL; `brew services` uses its own.
+            let ok = [LAUNCHD_LABEL, BREW_LABEL].iter().any(|label| {
+                Command::new("launchctl")
+                    .args(["kickstart", "-k", &format!("gui/{uid}/{label}")])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            });
             return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
         }
         _ => {}
