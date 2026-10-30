@@ -1,0 +1,100 @@
+# aw-timer 設定檔
+# 修改後執行 `aw-timer restart`（或重新登入）讓背景計時器套用新設定；
+# `aw-timer report` 每次執行都會重新讀取。
+
+[timer]
+server_url = "http://localhost:5600"
+poll_seconds = 30            # 背景計時器多久檢查一次
+break_gap_min = 5            # 離開（AFK）超過幾分鐘算真正休息
+max_interruption_min = 5     # 非專注活動連續超過幾分鐘，專注時段就結束
+min_session_min = 25         # 累積專注幾分鐘才算一個「專注時段」
+break_after_min = 50         # 連續工作多久提醒休息
+break_repeat_min = 15        # 沒休息的話，每隔幾分鐘再提醒一次
+distraction_alert_min = 10   # 連續分心幾分鐘提醒
+distraction_merge_sec = 60   # 分心中短暫切到別的 App 不會重置分心計時
+notify_focus_start = true    # 達成專注時段時通知
+notify_sound = "Glass"       # macOS 通知音效，留空 "" 為靜音
+launch_activitywatch = true  # ActivityWatch 沒開時自動幫你開
+menubar = true               # 在選單列顯示專注時間與薛西弗斯動畫
+menubar_fps = 12             # 動畫每秒格數（由 Core Animation 播放，幾乎不吃 CPU）；0 = 靜止
+
+# 背景音（選單列 🎧）。全部可省略，以下為預設值。音量跟隨系統音量／靜音，程式不會更動。
+# [sound]
+# lofi_url = "https://streams.ilovemusic.de/iloveradio17.mp3"
+# jazz_url = "https://jazz-wr01.ice.infomaniak.ch/jazz-wr01-128.mp3"
+# lounge_url = "https://live.radioart.com/fLounge.mp3"
+# classical_url = "http://onair.family977.com.tw:8000/live.mp3"   # 好家庭 97.7 古典音樂台
+# spotify_uri = ""   # 例如 "spotify:playlist:xxxx"；空白 = 繼續 Spotify 上次播的
+# feishin_port = 4333           # Feishin → 設定 → 啟用遠端控制伺服器
+# feishin_username = "feishin"
+# feishin_password = ""          # Feishin 設定頁顯示的遠端控制密碼
+
+# ---------------------------------------------------------------------------
+# 分類規則
+#   kind:    focus（專注）/ neutral（中性）/ distraction（分心）
+#   apps:    App 名稱完全相符（不分大小寫）— 優先比對
+#   pattern: 正規表示式，搜尋「App 名稱 + 視窗標題」（不分大小寫），依檔案順序比對
+# 瀏覽器（Vivaldi、Chrome…）不要放進 apps，讓它依網頁標題分類。
+# `aw-timer report` 底部會列出「未分類」最多的視窗，照著補規則即可。
+# ---------------------------------------------------------------------------
+
+[[category]]
+name = "溝通"
+kind = "neutral"
+apps = ["Messages", "訊息", "LINE", "Slack", "Discord", "Telegram", "WhatsApp",
+        "Mail", "郵件", "Microsoft Outlook", "Microsoft Teams", "zoom.us", "Messenger"]
+pattern = 'messenger|gmail|outlook|slack|discord|microsoft teams|meet\.google|google meet'
+
+[[category]]
+name = "社群"
+kind = "distraction"
+apps = ["Threads", "Instagram"]
+pattern = 'facebook|instagram|threads|twitter|\bx\.com|reddit|dcard|\bptt\b'
+
+[[category]]
+name = "娛樂"
+kind = "distraction"
+apps = ["Steam", "Netflix", "Spotify", "Music", "音樂", "TV", "Apple TV"]
+pattern = 'youtube|netflix|bilibili|twitch|disney\+|動畫瘋|巴哈姆特|spotify'
+
+[[category]]
+name = "寫程式"
+kind = "focus"
+apps = ["Code", "Visual Studio Code", "Cursor", "Xcode", "Zed", "Terminal", "終端機",
+        "iTerm2", "Ghostty", "WezTerm", "kitty", "Alacritty", "Warp", "Claude",
+        "Verdi", "GTKWave"]
+pattern = 'github|gitlab|stack ?overflow|verilog|cppreference|python\.org|localhost|127\.0\.0\.1'
+
+[[category]]
+name = "課業研究"
+kind = "focus"
+apps = ["Obsidian", "Preview", "預覽程式", "Zotero", "Notion", "Skim", "PDF Expert",
+        "Goodnotes", "GoodNotes", "MATLAB"]
+pattern = 'ntu ?cool|cool\.ntu|ceiba|arxiv|ieee|scholar|overleaf|\.pdf\b|lecture|講義|作業|homework|\bhw ?\d'
+
+[[category]]
+name = "文件寫作"
+kind = "focus"
+apps = ["Pages", "Keynote", "Numbers", "Microsoft Word", "Microsoft PowerPoint",
+        "Microsoft Excel"]
+pattern = 'google (docs|sheets|slides)|docs\.google'
+
+[[category]]
+name = "系統工具"
+kind = "neutral"
+apps = ["Finder", "System Settings", "系統設定", "Activity Monitor", "活動監視器",
+        "App Store", "ActivityWatch", "Calendar", "行事曆", "Reminders", "提醒事項",
+        "loginwindow"]
+
+# ---------------------------------------------------------------------------
+# 專案
+#   paths:   資料夾；Claude Code session 的工作目錄在裡面就算這個專案
+#   pattern: 正規表示式，搜尋「App 名稱 + 視窗標題」（不分大小寫）
+# 都沒對到時，專注時間會歸到選單「📁 目前專案」手動選的專案。
+# ---------------------------------------------------------------------------
+
+# 範例（取消註解並改成你自己的專案）：
+# [[project]]
+# name = "Thesis"
+# paths = ["~/Documents/thesis"]
+# pattern = 'thesis|overleaf|論文'
