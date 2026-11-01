@@ -15,7 +15,7 @@ objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
-objc2-event-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "EKCalendar", "EKCalendarItem", "EKEvent", "EKEventStore", "EKObject", "EKTypes"] }
+objc2-event-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "EKCalendar", "EKCalendarItem", "EKEvent", "EKEventStore", "EKObject", "EKSource", "EKTypes"] }
 objc2-foundation = "0.3"
 objc2-quartz-core = "0.3"
 regex = "1.13.1"

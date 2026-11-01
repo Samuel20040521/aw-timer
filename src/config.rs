@@ -1,5 +1,6 @@
 //! Configuration loading (same TOML format as the Python version).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use chrono::Duration;
@@ -141,6 +142,39 @@ pub fn save_overrides(new: &[Override]) -> Result<(), String> {
     let body = toml::to_string(&OverridesFile { overrides: all }).map_err(|e| e.to_string())?;
     let text = format!("# 由 `aw-timer report -i` 產生的手動分類，優先於 config.toml 的規則。\n\n{body}");
     let path = overrides_path();
+    std::fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Calendars hidden from the report timeline (chosen in its settings tab).
+pub fn calendars_path() -> PathBuf {
+    config_dir().join("calendars.toml")
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct CalendarsFile {
+    /// EventKit calendar identifiers.
+    #[serde(default)]
+    hidden: BTreeSet<String>,
+}
+
+/// Identifiers of hidden calendars; a missing or unreadable file hides none.
+pub fn hidden_calendars() -> BTreeSet<String> {
+    std::fs::read_to_string(calendars_path())
+        .ok()
+        .and_then(|t| toml::from_str::<CalendarsFile>(&t).ok())
+        .map(|f| f.hidden)
+        .unwrap_or_default()
+}
+
+/// Replace the set of hidden calendars.
+///
+/// # Errors
+/// Returns a message on write failure.
+pub fn save_hidden_calendars(hidden: &BTreeSet<String>) -> Result<(), String> {
+    let body = toml::to_string(&CalendarsFile { hidden: hidden.clone() }).map_err(|e| e.to_string())?;
+    let text = format!("# 由報表視窗的「設定」產生：這些行事曆不顯示在時間線上。\n\n{body}");
+    let path = calendars_path();
     std::fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
 }

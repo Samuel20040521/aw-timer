@@ -142,7 +142,7 @@ fn main() -> ExitCode {
                         let today = export::logical_day(chrono::Utc::now());
                         let start = export::day_start(today - chrono::Duration::days(days.max(1) - 1));
                         let end = export::day_start(today + chrono::Duration::days(1));
-                        serde_json::to_string(&calendar::events(start, end).unwrap_or_default())
+                        serde_json::to_string(&calendar::events(start, end, &config::hidden_calendars()).unwrap_or_default())
                     }
                     _ => serde_json::to_string(&export::daily(&acts)),
                 };

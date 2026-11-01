@@ -4,12 +4,14 @@
 //! from `Info.plist`, which `build.rs` embeds in the binary. Calls block the
 //! calling thread until the user answers, so use a worker thread.
 
+use std::collections::BTreeSet;
 use std::sync::mpsc;
 
 use block2::RcBlock;
 use chrono::{DateTime, TimeZone, Utc};
 use objc2::runtime::Bool;
-use objc2_event_kit::{EKAuthorizationStatus, EKEntityType, EKEventStore};
+use objc2_app_kit::{NSColor, NSColorSpace};
+use objc2_event_kit::{EKAuthorizationStatus, EKCalendar, EKEntityType, EKEventStore};
 use objc2_foundation::{NSDate, NSError, NSObjectProtocol};
 use serde::Serialize;
 
@@ -21,6 +23,19 @@ pub struct Event {
     pub end: DateTime<Utc>,
     pub all_day: bool,
     pub calendar: String,
+    /// The calendar's colour as `0xRRGGBB` (sRGB).
+    pub color: u32,
+}
+
+/// One calendar the user can show or hide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarInfo {
+    /// EventKit identifier, stable on this Mac.
+    pub id: String,
+    pub title: String,
+    /// Account it belongs to ("iCloud", a Google address, "其他"…).
+    pub source: String,
+    pub color: u32,
 }
 
 /// Why no events could be read.
@@ -69,11 +84,47 @@ fn to_chrono(d: &NSDate) -> DateTime<Utc> {
     Utc.timestamp_opt(secs.floor() as i64, ((secs.fract()) * 1e9) as u32).single().unwrap_or_default()
 }
 
-/// Events overlapping `[start, end)`, from every calendar, sorted by start.
+/// `0xRRGGBB` of a colour in sRGB; grey if it cannot be converted.
+fn rgb(color: &NSColor) -> u32 {
+    color.colorUsingColorSpace(&NSColorSpace::sRGBColorSpace()).map_or(0x8e8e93, |c| {
+        let ch = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+        (ch(c.redComponent()) << 16) | (ch(c.greenComponent()) << 8) | ch(c.blueComponent())
+    })
+}
+
+fn info(c: &EKCalendar) -> CalendarInfo {
+    // SAFETY: EKCalendar / EKSource property getters.
+    unsafe {
+        CalendarInfo {
+            id: c.calendarIdentifier().to_string(),
+            title: c.title().to_string(),
+            source: c.source().map_or_else(|| "其他".to_owned(), |s| s.title().to_string()),
+            color: rgb(&c.color()),
+        }
+    }
+}
+
+/// Every event calendar on this Mac, grouped by account, then by title.
 ///
 /// # Errors
 /// [`Denied::NoAccess`] when Calendar access is not granted.
-pub fn events(start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Event>, Denied> {
+pub fn calendars() -> Result<Vec<CalendarInfo>, Denied> {
+    // SAFETY: EKEventStore's plain initializer.
+    let store = unsafe { EKEventStore::new() };
+    ensure_access(&store)?;
+    // SAFETY: plain getter.
+    let all = unsafe { store.calendarsForEntityType(EKEntityType::Event) };
+    let mut out: Vec<CalendarInfo> = all.iter().map(|c| info(&c)).collect();
+    out.sort_by(|a, b| a.source.cmp(&b.source).then_with(|| a.title.cmp(&b.title)));
+    Ok(out)
+}
+
+/// Events overlapping `[start, end)` from every calendar not in `hidden`,
+/// sorted by start.
+///
+/// # Errors
+/// [`Denied::NoAccess`] when Calendar access is not granted.
+pub fn events(start: DateTime<Utc>, end: DateTime<Utc>, hidden: &BTreeSet<String>) -> Result<Vec<Event>, Denied> {
     // SAFETY: EKEventStore's plain initializer.
     let store = unsafe { EKEventStore::new() };
     ensure_access(&store)?;
@@ -88,16 +139,21 @@ pub fn events(start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Event>, De
     };
     let mut out: Vec<Event> = found
         .iter()
-        .map(|e| {
+        .filter_map(|e| {
             // SAFETY: EKEvent property getters.
             unsafe {
-                Event {
+                let cal = e.calendar().map(|c| info(&c));
+                if cal.as_ref().is_some_and(|c| hidden.contains(&c.id)) {
+                    return None;
+                }
+                Some(Event {
                     title: e.title().to_string(),
                     start: to_chrono(&e.startDate()),
                     end: to_chrono(&e.endDate()),
                     all_day: e.isAllDay(),
-                    calendar: e.calendar().map(|c| c.title().to_string()).unwrap_or_default(),
-                }
+                    calendar: cal.as_ref().map(|c| c.title.clone()).unwrap_or_default(),
+                    color: cal.map_or(0x8e8e93, |c| c.color),
+                })
             }
         })
         .collect();

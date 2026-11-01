@@ -1,6 +1,6 @@
 //! Native report window: a day timeline next to your calendar, totals,
-//! projects, one-click classification of uncategorized windows, and
-//! week / month / year trends.
+//! projects, one-click classification of uncategorized windows,
+//! week / month / year trends, and settings (which calendars to show).
 //!
 //! Days run from 04:00 to 04:00 (see [`export::DAY_START_HOUR`]).
 //!
@@ -12,7 +12,7 @@
 //! that replays a list of drawing ops; hover details are AppKit tooltips.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -24,6 +24,7 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor,
+    NSControlStateValueOff, NSControlStateValueOn,
     NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontDescriptorSystemDesignSerif, NSFontWeightBold,
     NSFontWeightMedium, NSFontWeightRegular, NSFontWeightSemibold, NSForegroundColorAttributeName,
     NSLineBreakMode, NSLineCapStyle, NSLineJoinStyle, NSMenu, NSMenuItem, NSMutableParagraphStyle,
@@ -35,7 +36,7 @@ use objc2_foundation::{
     NSSize, NSString, NSTimer, ns_string,
 };
 
-use crate::calendar::{self, Denied, Event};
+use crate::calendar::{self, CalendarInfo, Denied, Event};
 use crate::categorize::{Kind, Override, UNCATEGORIZED};
 use crate::claude_code::CodeIndex;
 use crate::client::AwClient;
@@ -66,6 +67,12 @@ const CHOICES: [(&str, Kind); 3] = [("專注", Kind::Focus), ("娛樂", Kind::Di
 pub enum Tab {
     Day,
     Trends,
+    Settings,
+}
+
+impl Tab {
+    /// Order of the window's tab control.
+    const ALL: [Tab; 3] = [Tab::Day, Tab::Trends, Tab::Settings];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,8 +169,13 @@ pub struct TrendView {
 #[derive(Debug, Clone)]
 pub struct Model {
     tab: Tab,
-    day: DayView,
+    /// The selected day; `None` on the settings tab.
+    day: Option<DayView>,
     trend: Option<TrendView>,
+    /// Calendars on this Mac; only loaded for the settings tab.
+    calendars: Option<Result<Vec<CalendarInfo>, Denied>>,
+    /// Identifiers of calendars hidden from the timeline.
+    hidden: BTreeSet<String>,
 }
 
 fn minutes(s: &Segment) -> f64 {
@@ -405,6 +417,8 @@ enum CtrlKind {
     /// Classify candidate `row` of the day's uncategorized list.
     Classify(usize),
     Period,
+    /// Show/hide calendar `i` of the settings list.
+    Calendar(usize),
 }
 
 /// A control to place at `frame`.
@@ -718,6 +732,7 @@ fn layout_timeline(l: &mut Layout, d: &DayView, now_min: Option<f64>, x: f64, y:
             let timed: Vec<&Event> = events.iter().filter(|e| !e.all_day).collect();
             if timed.is_empty() {
                 l.text("這天沒有行程", cal_x + 4.0, ty(20.0), cal_w - 4.0, Font::Small, Ink::Tertiary);
+                l.text("要顯示哪些行事曆，可在「設定」選擇", cal_x + 4.0, ty(20.0) + 16.0, cal_w - 4.0, Font::Small, Ink::Tertiary);
             }
             for e in timed {
                 let s = ((e.start - origin).num_seconds() as f64 / 60.0).clamp(0.0, 1440.0);
@@ -728,7 +743,8 @@ fn layout_timeline(l: &mut Layout, d: &DayView, now_min: Option<f64>, x: f64, y:
                 let (top, bottom) = (ty(s), ty(t));
                 let r = rect(cal_x, top, cal_w, (bottom - top).max(4.0));
                 l.fill(r, Ink::Background, 4.0);
-                l.ops.push(Op::Frame { rect: r, ink: Ink::Secondary, radius: 4.0, width: 1.5 });
+                l.fill(r, Ink::Rgb(e.color, 0.16), 4.0);
+                l.ops.push(Op::Frame { rect: r, ink: Ink::Rgb(e.color, 1.0), radius: 4.0, width: 1.5 });
                 if bottom - top >= 16.0 {
                     l.text(e.title.clone(), cal_x + 6.0, top + 1.0, cal_w - 10.0, Font::SmallBold, Ink::Label);
                 }
@@ -905,11 +921,67 @@ fn layout_trends(l: &mut Layout, t: &TrendView, x: f64, y: f64, w: f64) -> f64 {
     y2 + h2
 }
 
+/// Settings: which calendars the timeline shows, grouped by account.
+fn layout_settings(l: &mut Layout, m: &Model, x: f64, y: f64, w: f64) -> f64 {
+    let w = w.min(640.0);
+    let row_h = 26.0;
+    let cals = match &m.calendars {
+        Some(Ok(c)) => c.as_slice(),
+        _ => &[],
+    };
+    let groups = {
+        let mut g: Vec<&str> = cals.iter().map(|c| c.source.as_str()).collect();
+        g.dedup();
+        g.len()
+    };
+    let body = if cals.is_empty() { 60.0 } else { cals.len() as f64 * row_h + groups as f64 * 30.0 };
+    let h = 14.0 + 24.0 + 20.0 + 10.0 + body + 10.0;
+    let (cx, cy, cw) = l.card(x, y, w, h);
+    l.text("行事曆", cx, cy, cw, Font::Heading, Ink::Label);
+    l.text("勾選的行事曆會顯示在「這一天」的時間線上，改了立刻生效。", cx, cy + 24.0, cw, Font::Small, Ink::Secondary);
+    let mut ry = cy + 54.0;
+    match &m.calendars {
+        Some(Err(Denied::NoAccess)) => {
+            l.text("aw-timer 沒有讀取行事曆的權限。", cx, ry, cw, Font::Bold, Ink::Label);
+            l.text("到「系統設定 → 隱私權與安全性 → 行事曆」打開 aw-timer，再回到這裡按 ↻。", cx, ry + 22.0, cw, Font::Small, Ink::Secondary);
+        }
+        Some(Ok(_)) if cals.is_empty() => {
+            l.text("這台 Mac 上沒有行事曆。", cx, ry, cw, Font::Body, Ink::Tertiary);
+        }
+        None => l.text("載入中…", cx, ry, cw, Font::Body, Ink::Tertiary),
+        Some(Ok(_)) => {}
+    }
+    let mut last_source: Option<&str> = None;
+    for (i, c) in cals.iter().enumerate() {
+        if last_source != Some(c.source.as_str()) {
+            if last_source.is_some() {
+                ry += 6.0;
+            }
+            l.text(c.source.clone(), cx, ry, cw, Font::SmallBold, Ink::Secondary);
+            ry += 24.0;
+            last_source = Some(c.source.as_str());
+        }
+        l.fill(rect(cx + 2.0, ry + 6.0, 10.0, 10.0), Ink::Rgb(c.color, 1.0), 5.0);
+        let shown = !m.hidden.contains(&c.id);
+        l.ctrls.push(Ctrl {
+            frame: rect(cx + 20.0, ry, cw - 20.0, 22.0),
+            kind: CtrlKind::Calendar(i),
+            selected: Some(usize::from(shown)),
+        });
+        ry += row_h;
+    }
+    y + h
+}
+
 /// Lay out the whole page for content width `width`.
 fn layout(m: &Model, width: f64, now_min: Option<f64>) -> (Layout, f64) {
     let mut l = Layout::default();
     let (x, w) = (MARGIN, width - 2.0 * MARGIN);
-    let mut y = layout_header(&mut l, &m.day, x, 12.0, w) + 12.0;
+    let Some(day) = m.day.as_ref().filter(|_| m.tab != Tab::Settings) else {
+        let y = layout_settings(&mut l, m, x, 16.0, w);
+        return (l, y + 28.0);
+    };
+    let mut y = layout_header(&mut l, day, x, 12.0, w) + 12.0;
     match (m.tab, &m.trend) {
         (Tab::Trends, Some(t)) => y = layout_trends(&mut l, t, x, y, w),
         _ => {
@@ -917,16 +989,16 @@ fn layout(m: &Model, width: f64, now_min: Option<f64>) -> (Layout, f64) {
             if width >= TWO_COLUMNS_W {
                 let left_w = (w - gap) * 0.58;
                 let (rx, rw) = (x + left_w + gap, w - left_w - gap);
-                let left_end = layout_timeline(&mut l, &m.day, now_min, x, y, left_w);
-                let mut ry = layout_totals(&mut l, &m.day, rx, y, rw) + gap;
-                ry = layout_projects(&mut l, &m.day, rx, ry, rw) + gap;
-                ry = layout_uncategorized(&mut l, &m.day, rx, ry, rw);
+                let left_end = layout_timeline(&mut l, day, now_min, x, y, left_w);
+                let mut ry = layout_totals(&mut l, day, rx, y, rw) + gap;
+                ry = layout_projects(&mut l, day, rx, ry, rw) + gap;
+                ry = layout_uncategorized(&mut l, day, rx, ry, rw);
                 y = left_end.max(ry);
             } else {
-                y = layout_totals(&mut l, &m.day, x, y, w) + gap;
-                y = layout_timeline(&mut l, &m.day, now_min, x, y, w) + gap;
-                y = layout_projects(&mut l, &m.day, x, y, w) + gap;
-                y = layout_uncategorized(&mut l, &m.day, x, y, w);
+                y = layout_totals(&mut l, day, x, y, w) + gap;
+                y = layout_timeline(&mut l, day, now_min, x, y, w) + gap;
+                y = layout_projects(&mut l, day, x, y, w) + gap;
+                y = layout_uncategorized(&mut l, day, x, y, w);
             }
         }
     }
@@ -986,7 +1058,7 @@ struct Open {
     status: Retained<NSTextField>,
     tabs: Retained<NSSegmentedControl>,
     next: Retained<NSButton>,
-    ctrls: Vec<Retained<NSSegmentedControl>>,
+    ctrls: Vec<Retained<NSView>>,
     /// Tooltip texts; AppKit does not retain a tooltip's owner.
     tips: Vec<Retained<NSString>>,
 }
@@ -1045,7 +1117,7 @@ define_class!(
         #[unsafe(method(switchTab:))]
         fn switch_tab(&self, sender: Option<&AnyObject>) {
             let Some(ctrl) = sender.and_then(|s| s.downcast_ref::<NSSegmentedControl>()) else { return };
-            let tab = if ctrl.selectedSegment() == 1 { Tab::Trends } else { Tab::Day };
+            let tab = usize::try_from(ctrl.selectedSegment()).ok().and_then(|i| Tab::ALL.get(i)).copied().unwrap_or(Tab::Day);
             if tab != self.ivars().tab.get() {
                 self.ivars().tab.set(tab);
                 self.load();
@@ -1061,6 +1133,28 @@ define_class!(
             }
         }
 
+        /// A calendar checkbox in settings changed; its tag indexes the list.
+        #[unsafe(method(toggleCalendar:))]
+        fn toggle_calendar(&self, sender: Option<&AnyObject>) {
+            let Some(button) = sender.and_then(|s| s.downcast_ref::<NSButton>()) else { return };
+            let shown = button.state() == NSControlStateValueOn;
+            let saved = {
+                let mut data = self.ivars().data.borrow_mut();
+                let Some(m) = data.as_mut() else { return };
+                let Some(Ok(cals)) = &m.calendars else { return };
+                let Some(cal) = usize::try_from(button.tag()).ok().and_then(|i| cals.get(i)) else { return };
+                if shown {
+                    m.hidden.remove(&cal.id);
+                } else {
+                    m.hidden.insert(cal.id.clone());
+                }
+                config::save_hidden_calendars(&m.hidden)
+            };
+            if let Err(e) = saved {
+                self.set_status(&format!("儲存失敗：{e}"));
+            }
+        }
+
         /// A classification segment was clicked; the control's tag is the
         /// row in the day's uncategorized list.
         #[unsafe(method(classify:))]
@@ -1070,7 +1164,7 @@ define_class!(
             let choice = usize::try_from(seg).ok().and_then(|i| CHOICES.get(i));
             let cand = usize::try_from(row)
                 .ok()
-                .and_then(|i| self.ivars().data.borrow().as_ref()?.day.uncategorized.get(i).cloned());
+                .and_then(|i| self.ivars().data.borrow().as_ref()?.day.as_ref()?.uncategorized.get(i).cloned());
             let (Some(&(category, kind)), Some(cand)) = (choice, cand) else { return };
             let ov = Override { match_on: cand.on, value: cand.value, category: category.into(), kind };
             match config::save_overrides(&[ov]) {
@@ -1123,21 +1217,25 @@ fn today() -> NaiveDate {
 
 /// Load one page on the calling (worker) thread.
 fn load_model(day: NaiveDate, tab: Tab, period: Period, config_path: Option<&str>, code: &Mutex<CodeIndex>) -> Loaded {
+    let hidden = config::hidden_calendars();
+    if tab == Tab::Settings {
+        return Ok(Model { tab, day: None, trend: None, calendars: Some(calendar::calendars()), hidden });
+    }
     let (settings, mut cat, _) = config::load(config_path)?;
     let mut client = AwClient::new(&settings.server_url);
     let (from, to) = match tab {
-        Tab::Day => (day, day),
         Tab::Trends => period.range(day),
+        _ => (day, day),
     };
     let mut code = code.lock().unwrap_or_else(|e| e.into_inner());
     let (acts, ..) =
         tracker::load_day(&mut client, &mut cat, &mut code, day_start(from), day_start(to + Duration::days(1)))
             .map_err(|e| format!("連不到 ActivityWatch（{e}）。請確認它有在執行。"))?;
     drop(code);
-    let events = calendar::events(day_start(day), day_start(day + Duration::days(1)));
+    let events = calendar::events(day_start(day), day_start(day + Duration::days(1)), &hidden);
     let day_view = build_day(day, &acts, events, settings.max_interruption_min);
     let trend = (tab == Tab::Trends).then(|| build_trend(period, day, &acts));
-    Ok(Model { tab, day: day_view, trend })
+    Ok(Model { tab, day: Some(day_view), trend, calendars: None, hidden })
 }
 
 impl ReportController {
@@ -1207,19 +1305,23 @@ impl ReportController {
         let bar = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, ch - TOP_BAR, cw, TOP_BAR));
         bar.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin);
         let target: &AnyObject = self;
-        let labels = NSArray::from_retained_slice(&[NSString::from_str("這一天"), NSString::from_str("每週・每月・每年")]);
+        let labels = NSArray::from_retained_slice(&[
+            NSString::from_str("這一天"),
+            NSString::from_str("每週・每月・每年"),
+            NSString::from_str("設定"),
+        ]);
         // SAFETY: `self` implements switchTab: and outlives the window.
         let tabs = unsafe {
             NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
                 &labels, NSSegmentSwitchTracking::SelectOne, Some(target), Some(sel!(switchTab:)), mtm)
         };
         tabs.setSelectedSegment(0);
-        tabs.setFrame(rect(MARGIN, 15.0, 240.0, 26.0));
+        tabs.setFrame(rect(MARGIN, 15.0, 300.0, 26.0));
         bar.addSubview(&tabs);
         let status = NSTextField::labelWithString(ns_string!(""), mtm);
         status.setFont(Some(&NSFont::systemFontOfSize(12.0)));
         status.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        status.setFrame(rect(MARGIN + 252.0, 19.0, (cw - MARGIN - 252.0 - 260.0).max(80.0), 17.0));
+        status.setFrame(rect(MARGIN + 312.0, 19.0, (cw - MARGIN - 312.0 - 260.0).max(80.0), 17.0));
         status.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
         bar.addSubview(&status);
         let button = |label: &str, action, key: &str, cmd: bool, x: f64, w: f64| {
@@ -1323,7 +1425,7 @@ impl ReportController {
         let day = iv.day.get();
         open.0.setTitle(&NSString::from_str(&format!("aw-timer 報表 — {}", day_title(day))));
         open.1.setEnabled(day < today());
-        open.2.setSelectedSegment(if iv.tab.get() == Tab::Trends { 1 } else { 0 });
+        open.2.setSelectedSegment(Tab::ALL.iter().position(|t| *t == iv.tab.get()).unwrap_or(0) as isize);
     }
 
     /// Re-layout for the current width and data; rebuild the controls and
@@ -1337,8 +1439,11 @@ impl ReportController {
         let now = Utc::now();
         let (lay, height) = match iv.data.borrow().as_ref() {
             Some(m) => {
-                let now_min = (logical_day(now) == m.day.day)
-                    .then(|| (now - day_start(m.day.day)).num_seconds() as f64 / 60.0);
+                let now_min = m
+                    .day
+                    .as_ref()
+                    .filter(|d| logical_day(now) == d.day)
+                    .map(|d| (now - day_start(d.day)).num_seconds() as f64 / 60.0);
                 layout(m, width, now_min)
             }
             None => (Layout::default(), 200.0),
@@ -1350,27 +1455,49 @@ impl ReportController {
             c.removeFromSuperview();
         }
         let target: &AnyObject = self;
+        let cal_titles: Vec<String> = iv
+            .data
+            .borrow()
+            .as_ref()
+            .and_then(|m| m.calendars.as_ref()?.as_ref().ok().map(|c| c.iter().map(|c| c.title.clone()).collect()))
+            .unwrap_or_default();
         for c in lay.ctrls {
-            let (labels, action): (Vec<&str>, _) = match c.kind {
-                CtrlKind::Classify(_) => (CHOICES.iter().map(|c| c.0).collect(), sel!(classify:)),
-                CtrlKind::Period => (Period::ALL.iter().map(|p| p.label()).collect(), sel!(switchPeriod:)),
+            let view: Retained<NSView> = match c.kind {
+                CtrlKind::Calendar(i) => {
+                    let title = NSString::from_str(cal_titles.get(i).map_or("", String::as_str));
+                    // SAFETY: `self` implements toggleCalendar: and outlives the window.
+                    let b = unsafe {
+                        NSButton::checkboxWithTitle_target_action(&title, Some(target), Some(sel!(toggleCalendar:)), mtm)
+                    };
+                    b.setTag(i as isize);
+                    b.setState(if c.selected == Some(1) { NSControlStateValueOn } else { NSControlStateValueOff });
+                    b.setFrame(c.frame);
+                    Retained::into_super(Retained::into_super(b))
+                }
+                CtrlKind::Classify(_) | CtrlKind::Period => {
+                    let (labels, action): (Vec<&str>, _) = match c.kind {
+                        CtrlKind::Period => (Period::ALL.iter().map(|p| p.label()).collect(), sel!(switchPeriod:)),
+                        _ => (CHOICES.iter().map(|c| c.0).collect(), sel!(classify:)),
+                    };
+                    let labels: Vec<Retained<NSString>> = labels.into_iter().map(NSString::from_str).collect();
+                    let labels = NSArray::from_retained_slice(&labels);
+                    // SAFETY: `self` implements both actions and outlives the window.
+                    let ctrl = unsafe {
+                        NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
+                            &labels, NSSegmentSwitchTracking::SelectOne, Some(target), Some(action), mtm)
+                    };
+                    ctrl.setFrame(c.frame);
+                    if let CtrlKind::Classify(row) = c.kind {
+                        ctrl.setTag(row as isize);
+                    }
+                    if let Some(i) = c.selected {
+                        ctrl.setSelectedSegment(i as isize);
+                    }
+                    Retained::into_super(Retained::into_super(ctrl))
+                }
             };
-            let labels: Vec<Retained<NSString>> = labels.into_iter().map(NSString::from_str).collect();
-            let labels = NSArray::from_retained_slice(&labels);
-            // SAFETY: `self` implements both actions and outlives the window.
-            let ctrl = unsafe {
-                NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
-                    &labels, NSSegmentSwitchTracking::SelectOne, Some(target), Some(action), mtm)
-            };
-            ctrl.setFrame(c.frame);
-            if let CtrlKind::Classify(row) = c.kind {
-                ctrl.setTag(row as isize);
-            }
-            if let Some(i) = c.selected {
-                ctrl.setSelectedSegment(i as isize);
-            }
-            open.doc.addSubview(&ctrl);
-            open.ctrls.push(ctrl);
+            open.doc.addSubview(&view);
+            open.ctrls.push(view);
         }
         open.doc.removeAllToolTips();
         open.tips.clear();
@@ -1448,7 +1575,13 @@ mod tests {
     #[test]
     fn layout_fits_width_and_has_one_classifier_per_uncategorized() {
         let (day, acts) = sample();
-        let model = Model { tab: Tab::Day, day: build_day(day, &acts, Err(Denied::NoAccess), 5.0), trend: None };
+        let model = Model {
+            tab: Tab::Day,
+            day: Some(build_day(day, &acts, Err(Denied::NoAccess), 5.0)),
+            trend: None,
+            calendars: None,
+            hidden: BTreeSet::new(),
+        };
         for width in [MIN_W, 1200.0] {
             let (l, height) = layout(&model, width, None);
             assert!(height > 24.0 * HOUR_PX);
@@ -1472,5 +1605,21 @@ mod tests {
             assert!((sum - 3600.0).abs() < 2.0);
         }
         assert_eq!(Period::Month.range(NaiveDate::from_ymd_opt(2026, 2, 10).unwrap()).1.day(), 28);
+    }
+
+    #[test]
+    fn settings_lists_one_checkbox_per_calendar_with_hidden_unchecked() {
+        let cal = |id: &str, source: &str| CalendarInfo { id: id.into(), title: id.into(), source: source.into(), color: 0x3366cc };
+        let model = Model {
+            tab: Tab::Settings,
+            day: None,
+            trend: None,
+            calendars: Some(Ok(vec![cal("a", "iCloud"), cal("b", "iCloud"), cal("c", "Google")])),
+            hidden: BTreeSet::from(["b".to_owned()]),
+        };
+        let (l, _) = layout(&model, 900.0, None);
+        let checks: Vec<Option<usize>> =
+            l.ctrls.iter().filter(|c| matches!(c.kind, CtrlKind::Calendar(_))).map(|c| c.selected).collect();
+        assert_eq!(checks, vec![Some(1), Some(0), Some(1)]);
     }
 }

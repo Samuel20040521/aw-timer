@@ -925,6 +925,7 @@ dependencies = [
  "bitflags",
  "block2",
  "objc2",
+ "objc2-app-kit",
  "objc2-foundation",
 ]
 
