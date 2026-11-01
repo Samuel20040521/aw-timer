@@ -19,7 +19,7 @@ All tracking data stays on your Mac. No account, no cloud.
 - **Menu bar timer.** The top line shows the minutes of your current focus streak, and the bottom line shows today's focus hours (e.g. `25m / 3.2h`). The animation runs on Core Animation and uses about 0% CPU.
 - **Focus sessions.** A focus session is at least 25 focused minutes with no interruption of 5 minutes or more.
 - **Notifications.**
-  - Take a break after 50 minutes of continuous work.
+  - A break reminder after 50 minutes at the computer since your last real break (any activity counts, not just focus).
   - Get back on track after 10 minutes of distraction.
   - A message when a focus session starts.
 - **Forced breaks** of 5, 10, 15 or 30 minutes, or until you end them.

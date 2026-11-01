@@ -111,7 +111,7 @@ impl Snapshot {
         let Some(block) = &self.block else {
             return format!("{line}\n目前：休息中");
         };
-        let mut now = vec![format!("連續工作 {}", fmt_duration(seconds(self.now - block.start)))];
+        let mut now = vec![format!("距上次休息 {}", fmt_duration(seconds(self.now - block.start)))];
         if let Some(s) = &self.session {
             now.push(format!("🎯 專注時段 {}（{}）", fmt_duration(s.active_seconds), s.top_category()));
         }
@@ -365,7 +365,7 @@ impl Notifier {
             return out;
         }
 
-        // 1. Break reminder: long continuous work block without a real break.
+        // 1. Break reminder: long screen time (any non-rest activity) since the last real break.
         if let Some(block) = &snap.block {
             let worked = seconds(snap.now - block.start);
             let due = self
@@ -377,7 +377,7 @@ impl Notifier {
                 out.push((
                     "該休息了 ☕".into(),
                     format!(
-                        "已連續工作 {}，起來走走、離開螢幕 {} 分鐘吧",
+                        "距上次休息已 {}（用電腦的時間都算，不只專注），起來走走、離開螢幕 {} 分鐘吧",
                         fmt_duration(worked),
                         self.s.break_gap_min
                     ),
