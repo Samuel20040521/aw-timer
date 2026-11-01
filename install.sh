@@ -29,6 +29,9 @@ mkdir -p "${APP_DIR}" "${CONF_DIR}" "$(dirname "${BIN_LINK}")" \
 # Stop the running agent before replacing its executable.
 launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
 install -m 755 "${BUILT}" "${EXE}"
+# Re-sign so the embedded Info.plist is bound to the signature; macOS needs
+# it to show the Calendar permission prompt.
+codesign --force --sign - "${EXE}" 2>/dev/null || true
 rm -rf "${APP_DIR}/aw_timer"   # leftover Python package, if any
 
 # Never overwrite a config the user has already edited.

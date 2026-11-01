@@ -25,7 +25,7 @@ All tracking data stays on your Mac. No account, no cloud.
 - **Forced breaks** of 5, 10, 15 or 30 minutes, or until you end them.
 - **Focus goal** that you type in. It appears in the menu, in notifications and in the report.
 - **Projects.** Time is assigned to a project by window-title rules, by the working folder of your [Claude Code](https://claude.com/claude-code) session, or by a project you pick from the menu.
-- **Daily report** in the terminal (`aw-timer report -i`), where you can also reclassify items interactively.
+- **Report window** (menu → 📊 報表與分類…, ⌘R): a vertical timeline of the day (04:00 to 04:00) with your activity, projects and macOS Calendar events side by side, day totals, projects, and the day's uncategorized windows with one-click buttons to classify them as focus, entertainment or neutral. A second tab shows week, month and year totals by type and category. ← → switch days. It is a native AppKit window: it uses no CPU while open and idle, and its views and data are released when it closes. The same report is also available in the terminal (`aw-timer report -i`).
 - **Background sound.** Right-click the icon to play or pause.
   - Free internet radio: Lofi, Jazz, Lounge, and 97.7 Classical (好家庭).
   - Procedurally generated rain, coffee shop, white, pink and brown noise, and binaural beats.
@@ -100,7 +100,7 @@ cd aw-timer && ./install.sh
 | Left-click the icon | Open the menu: rest, goal, project, background sound, report |
 | Right-click (or Control-click) | Play or pause background sound |
 | `aw-timer status` | Current state |
-| `aw-timer report [-1 \| YYYY-MM-DD] [-i]` | Daily report. `-i` lets you classify items as focus, entertainment or neutral |
+| `aw-timer report [-1 \| YYYY-MM-DD] [-i \| -w]` | Daily report in the terminal. `-i` lets you classify items as focus, entertainment or neutral; `-w` opens the report window instead |
 | `aw-timer restart` | Reload after editing the config |
 
 Configuration lives in `~/.config/aw-timer/config.toml`: thresholds, category rules, projects and sound URLs. Every option is documented in [`default_config.toml`](default_config.toml).

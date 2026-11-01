@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -90,38 +90,54 @@ impl CodeIndex {
             return false;
         }
         let Ok(mut file) = File::open(path) else { return false };
-        let mut buf = Vec::new();
-        if file.seek(SeekFrom::Start(offset)).is_err() || file.read_to_end(&mut buf).is_err() {
+        if file.seek(SeekFrom::Start(offset)).is_err() {
             return false;
         }
-        // Stop at the last newline: a half-written line is retried later.
-        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return false };
-        self.offsets.insert(path.clone(), offset + end as u64 + 1);
-        let mut added = false;
-        for raw in buf[..end].split(|&b| b == b'\n') {
-            // Cheap prefilter before JSON parsing.
-            let interesting = memchr_contains(raw, b"\"timestamp\"") || memchr_contains(raw, b"customTitle");
-            if !interesting {
-                continue;
+        // Stream line by line: transcripts reach hundreds of MB, so only
+        // one line is held in memory at a time.
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let (mut raw, mut consumed, mut added) = (Vec::new(), offset, false);
+        loop {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
             }
-            let Ok(line) = serde_json::from_slice::<Line>(raw) else { continue };
-            if line.kind.as_deref() == Some("custom-title") {
-                if let (Some(id), Some(title)) = (line.session_id, line.custom_title) {
-                    self.titles.insert(id, title);
-                }
-                continue;
+            // A half-written last line is retried on the next refresh.
+            if raw.last() != Some(&b'\n') {
+                break;
             }
-            let (Some(ts), Some(cwd), Some(session)) = (line.timestamp, line.cwd, line.session_id) else {
-                continue;
-            };
-            let Ok(t) = DateTime::parse_from_rfc3339(&ts) else { continue };
-            let t = t.with_timezone(&Utc);
-            if t >= since {
-                self.events.push(CodeEvent { t, session, cwd });
-                added = true;
-            }
+            consumed += raw.len() as u64;
+            added |= self.parse_line(&raw[..raw.len() - 1], since);
         }
+        self.offsets.insert(path.clone(), consumed);
         added
+    }
+
+    /// Record one transcript line. Returns whether an event was added.
+    fn parse_line(&mut self, raw: &[u8], since: DateTime<Utc>) -> bool {
+        // Cheap prefilter before JSON parsing.
+        let interesting = memchr_contains(raw, b"\"timestamp\"") || memchr_contains(raw, b"customTitle");
+        if !interesting {
+            return false;
+        }
+        let Ok(line) = serde_json::from_slice::<Line>(raw) else { return false };
+        if line.kind.as_deref() == Some("custom-title") {
+            if let (Some(id), Some(title)) = (line.session_id, line.custom_title) {
+                self.titles.insert(id, title);
+            }
+            return false;
+        }
+        let (Some(ts), Some(cwd), Some(session)) = (line.timestamp, line.cwd, line.session_id) else {
+            return false;
+        };
+        let Ok(t) = DateTime::parse_from_rfc3339(&ts) else { return false };
+        let t = t.with_timezone(&Utc);
+        if t < since {
+            return false;
+        }
+        self.events.push(CodeEvent { t, session, cwd });
+        true
     }
 
     /// Events with `start <= t <= end` (binary search; O(log n + k)).

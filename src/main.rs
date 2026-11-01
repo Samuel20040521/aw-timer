@@ -1,13 +1,16 @@
 //! aw-timer: Rize-style focus timer built on top of ActivityWatch.
 
+mod calendar;
 mod categorize;
 mod claude_code;
 mod client;
 mod config;
+mod export;
 mod journal;
 mod menubar;
 mod notify;
 mod report;
+mod reportwin;
 mod sessions;
 mod sisyphus;
 mod sound;
@@ -32,9 +35,13 @@ const USAGE: &str = "\
                  背景計時器＋選單列（launchd 會執行這個）
                  -v 每次檢查都印出狀態；--headless 不顯示選單列
   status         目前狀態
-  report [日期] [-i]
+  report [日期] [-i | -w]
                  每日報表；日期可為 YYYY-MM-DD、today、yesterday 或 -N（N 天前）
                  -i 報表後可手動把項目分類成專注／娛樂／中性
+                 -w 用視窗開啟（和選單的「報表與分類…」相同）
+  export <segments|daily|calendar> [天數]
+                 輸出 JSON（一天從 04:00 算到隔天 04:00）給儀表板用；
+                 segments 預設 35 天，daily 預設 400 天
   test-notify    送出一則測試通知
   config         顯示目前使用的設定檔路徑
   restart        重新啟動背景計時器以套用新設定
@@ -106,7 +113,7 @@ fn main() -> ExitCode {
             let verbose = rest.iter().any(|a| a == "-v" || a == "--verbose");
             let reload = reloader(config_path.clone());
             if settings.menubar && !rest.iter().any(|a| a == "--headless") {
-                menubar::run(settings, client, categorizer, verbose, reload)
+                menubar::run(settings, client, categorizer, verbose, reload, config_path.clone())
             }
             tracker::run_forever(&mut client, &mut categorizer, &settings, verbose, |_| {}, reload, None)
         }
@@ -124,9 +131,30 @@ fn main() -> ExitCode {
                 }
             };
         }
+        "export" => {
+            // `export segments|daily [days]`: JSON rows for dashboards.
+            let what = rest.first().map(String::as_str).unwrap_or("daily");
+            let days = rest.get(1).and_then(|d| d.parse::<i64>().ok()).unwrap_or(if what == "segments" { 35 } else { 400 });
+            export::load(&mut client, &mut categorizer, days).map(|acts| {
+                let json = match what {
+                    "segments" => serde_json::to_string(&export::segments(acts)),
+                    "calendar" => {
+                        let today = export::logical_day(chrono::Utc::now());
+                        let start = export::day_start(today - chrono::Duration::days(days.max(1) - 1));
+                        let end = export::day_start(today + chrono::Duration::days(1));
+                        serde_json::to_string(&calendar::events(start, end).unwrap_or_default())
+                    }
+                    _ => serde_json::to_string(&export::daily(&acts)),
+                };
+                println!("{}", json.unwrap_or_else(|_| "[]".into()));
+            })
+        }
         "status" => tracker::snapshot(&mut client, &mut categorizer, &mut claude_code::CodeIndex::default(), &settings)
             .map(|snap| println!("{}", snap.status_line())),
         "report" => {
+            if rest.iter().any(|a| a == "-w" || a == "--window") {
+                reportwin::run_standalone(config_path.clone());
+            }
             let interactive = rest.iter().any(|a| a == "-i" || a == "--classify");
             let day_arg = rest.iter().find(|a| *a != "-i" && *a != "--classify");
             let day = match report::parse_day(day_arg.map(String::as_str)) {
@@ -144,7 +172,7 @@ fn main() -> ExitCode {
                     Ok(v) => v,
                     Err(e) => break Err(e),
                 };
-                println!("{}", report::render(&acts, day, &settings, color, &rests, &entries));
+                println!("{}", report::render(&report::build(&acts, day, &settings, &rests, &entries), color));
                 let cands = report::candidates(&acts, 12);
                 if !interactive || cands.is_empty() {
                     break Ok(());

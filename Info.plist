@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>local.aw-timer</string>
+	<key>CFBundleName</key>
+	<string>aw-timer</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>aw-timer 會把你的行程顯示在報表時間線旁邊，和你的專注時間對照。行程只在本機讀取，不會上傳。</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>aw-timer 會把你的行程顯示在報表時間線旁邊，和你的專注時間對照。行程只在本機讀取，不會上傳。</string>
+</dict>
+</plist>

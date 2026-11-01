@@ -79,79 +79,83 @@ fn ranked<K: Ord + Clone>(m: &HashMap<K, f64>) -> Vec<(K, f64)> {
     v
 }
 
-/// Render the report for one day.
-pub fn render(
-    acts: &[Activity],
-    day: NaiveDate,
-    settings: &Settings,
-    color: bool,
-    rests: &[Rest],
-    entries: &[Entry],
-) -> String {
-    let st = Style { on: color };
-    let mut o = String::new();
-    // `writeln!` into a String cannot fail.
-    macro_rules! line { ($($t:tt)*) => { let _ = writeln!(o, $($t)*); } }
+/// A finished focus session as shown in the report.
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    /// Local `HH:MM` start and end.
+    pub start: String,
+    pub end: String,
+    pub focus: f64,
+    pub span: f64,
+    pub project: Option<String>,
+    pub category: String,
+    pub label: String,
+    pub goal: Option<String>,
+}
 
-    let weekday = WEEKDAYS[day.weekday().num_days_from_monday() as usize];
-    line!("{}", st.bold(&format!("📅 {}（週{weekday}）", day.format("%Y-%m-%d"))));
-    let total: f64 = acts.iter().map(Activity::seconds).sum();
-    if total < 60.0 {
-        line!("這天還沒有足夠的活動紀錄。");
-        return o;
+/// Everything the report shows for one day, independent of presentation.
+#[derive(Debug, Clone)]
+pub struct DayReport {
+    pub day: NaiveDate,
+    /// Active seconds (all kinds).
+    pub total: f64,
+    pub by_kind: [f64; 4],
+    /// Kinds worth listing (forced rest only on days that had one).
+    pub kinds: Vec<Kind>,
+    pub sessions: Vec<SessionRow>,
+    pub min_session_min: f64,
+    pub max_interruption_min: f64,
+    /// Number and total seconds of forced rests.
+    pub rests: (usize, f64),
+    /// `(project, focus seconds, all seconds)` by descending focus.
+    pub projects: Vec<(String, f64, f64)>,
+    /// `(session name, project or "", seconds)`, at most 8.
+    pub code: Vec<(String, String, f64)>,
+    /// `(category, kind, seconds)` by descending time.
+    pub categories: Vec<(String, Kind, f64)>,
+    /// Contiguous hours from the first to the last active one.
+    pub hours: Vec<(u32, [f64; 4])>,
+    /// `(label, category, seconds)`, at most 8.
+    pub top: Vec<(String, String, f64)>,
+    /// `("app | title", seconds)` of uncategorized windows, at most 5.
+    pub uncategorized: Vec<(String, f64)>,
+}
+
+impl DayReport {
+    /// Whether the day has enough activity to be worth reporting.
+    pub fn has_data(&self) -> bool {
+        self.total >= 60.0
     }
 
+    pub fn weekday(&self) -> &'static str {
+        WEEKDAYS[self.day.weekday().num_days_from_monday() as usize]
+    }
+}
+
+/// Aggregate one day's activities into a [`DayReport`].
+///
+/// Time O(n log n) for n activities (sorting in span merging and ranking).
+pub fn build(acts: &[Activity], day: NaiveDate, settings: &Settings, rests: &[Rest], entries: &[Entry]) -> DayReport {
+    let total: f64 = acts.iter().map(Activity::seconds).sum();
     let mut by_kind = [0.0_f64; 4];
     for a in acts {
         by_kind[a.kind.index()] += a.seconds();
     }
-    // Only mention forced rest on days that had one.
-    let shown_kinds: Vec<Kind> =
-        Kind::ALL.into_iter().filter(|&k| k != Kind::Rest || by_kind[k.index()] > 0.0).collect();
-    let kinds: Vec<String> = shown_kinds
+    let kinds = Kind::ALL.into_iter().filter(|&k| k != Kind::Rest || by_kind[k.index()] > 0.0).collect();
+
+    let sessions = focus_sessions(acts, settings.max_interruption(), settings.min_session(), &barriers(rests))
         .iter()
-        .map(|&k| {
-            let s = by_kind[k.index()];
-            st.kind(k, &format!("{} {}（{:.0}%）", k.label(), fmt_duration(s), s / total * 100.0))
+        .map(|s| SessionRow {
+            start: s.start.with_timezone(&Local).format("%H:%M").to_string(),
+            end: s.end.with_timezone(&Local).format("%H:%M").to_string(),
+            focus: s.active_seconds,
+            span: seconds(s.end - s.start),
+            project: s.top_project().map(str::to_owned),
+            category: s.top_category().to_owned(),
+            label: s.top_label().to_owned(),
+            goal: journal::goal_at(entries, s.end),
         })
         .collect();
-    line!("活躍 {}   {}", st.bold(&fmt_duration(total)), kinds.join("   "));
-
-    // Focus sessions.
-    let sessions =
-        focus_sessions(acts, settings.max_interruption(), settings.min_session(), &barriers(rests));
-    line!();
-    let head = st.bold(&format!("🎯 專注時段 {} 個", sessions.len()));
-    if sessions.is_empty() {
-        line!(
-            "{head}{}",
-            st.dim(&format!(
-                "（累積專注 ≥ {} 分鐘、中斷 < {} 分鐘才算）",
-                settings.min_session_min, settings.max_interruption_min
-            ))
-        );
-    } else {
-        let sum: f64 = sessions.iter().map(|s| s.active_seconds).sum();
-        line!("{head}，共 {}", fmt_duration(sum));
-    }
-    for s in &sessions {
-        let goal = journal::goal_at(entries, s.end).map_or(String::new(), |g| format!("  🎯 {g}"));
-        let project = s.top_project().map_or(String::new(), |p| format!("[{p}] "));
-        line!(
-            "  {}–{}  {:>7} 專注 / {:>7}  {project}{} · {}{}",
-            s.start.with_timezone(&Local).format("%H:%M"),
-            s.end.with_timezone(&Local).format("%H:%M"),
-            fmt_duration(s.active_seconds),
-            fmt_duration(seconds(s.end - s.start)),
-            s.top_category(),
-            s.top_label(),
-            st.bold(&goal)
-        );
-    }
-    if !rests.is_empty() {
-        let total: f64 = rests.iter().map(|r| seconds(r.end - r.start)).sum();
-        line!("{}", st.kind(Kind::Rest, &format!("☕ 強制休息 {} 次，共 {}", rests.len(), fmt_duration(total))));
-    }
 
     // Projects: focus time and all time per project.
     let mut by_project: HashMap<String, [f64; 2]> = HashMap::new();
@@ -164,23 +168,8 @@ pub fn render(
             }
         }
     }
-    if !by_project.is_empty() {
-        line!();
-        line!("{}", st.bold("📁 專案"));
-        let focus_total: f64 = by_kind[Kind::Focus.index()].max(1.0);
-        let mut rows: Vec<(String, [f64; 2])> = by_project.into_iter().collect();
-        rows.sort_by(|a, b| b.1[0].total_cmp(&a.1[0]).then_with(|| a.0.cmp(&b.0)));
-        let width = rows.iter().map(|(n, _)| n.width()).max().unwrap_or(0);
-        for (name, [focus, all]) in rows {
-            let pad = " ".repeat(width - name.width());
-            line!(
-                "  {name}{pad}  {} 專注 {:>7}  {}",
-                st.kind(Kind::Focus, &bar(focus / focus_total, 16)),
-                fmt_duration(focus),
-                st.dim(&format!("（含其他活動共 {}）", fmt_duration(all)))
-            );
-        }
-    }
+    let mut projects: Vec<(String, f64, f64)> = by_project.into_iter().map(|(n, [f, a])| (n, f, a)).collect();
+    projects.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     // Claude Code sessions recognised from local transcripts.
     let mut code: HashMap<(String, String), f64> = HashMap::new();
@@ -189,80 +178,179 @@ pub fn render(
             *code.entry((d.clone(), a.project.clone().unwrap_or_default())).or_default() += a.seconds();
         }
     }
-    if !code.is_empty() {
-        line!();
-        line!("{}", st.bold("🤖 Claude Code sessions"));
-        for ((name, project), sec) in ranked(&code).into_iter().take(8) {
-            let name: String = name.chars().take(40).collect();
-            let tag = if project.is_empty() { String::new() } else { format!("  [{project}]") };
-            line!("  {:>7}  {name}{}", fmt_duration(sec), st.dim(&tag));
-        }
-    }
+    let code = ranked(&code).into_iter().take(8).map(|((n, p), s)| (n, p, s)).collect();
 
-
-    // Categories.
     let mut by_cat: HashMap<String, f64> = HashMap::new();
     let mut cat_kind: HashMap<&str, Kind> = HashMap::new();
     for a in acts {
         *by_cat.entry(a.category.clone()).or_default() += a.seconds();
         cat_kind.insert(&a.category, a.kind);
     }
-    line!();
-    line!("{}", st.bold("📊 分類"));
-    let width = by_cat.keys().map(|c| c.width()).max().unwrap_or(0);
-    for (cat, sec) in ranked(&by_cat) {
-        let pad = " ".repeat(width - cat.width());
-        line!(
-            "  {cat}{pad}  {} {:>7}  {:>3.0}%",
-            st.kind(cat_kind[cat.as_str()], &bar(sec / total, 20)),
-            fmt_duration(sec),
-            sec / total * 100.0
-        );
-    }
+    let categories = ranked(&by_cat).into_iter().map(|(c, s)| (c.clone(), cat_kind[c.as_str()], s)).collect();
 
-    // Hourly timeline, 2 minutes per character.
-    let hours = hourly(acts);
-    let legend: Vec<String> = shown_kinds.iter().map(|&k| st.kind(k, &format!("█{}", k.label()))).collect();
-    line!();
-    line!("{}  {}", st.bold("🕐 每小時"), legend.join(" "));
-    if let (Some(&first), Some(&last)) = (hours.keys().next(), hours.keys().next_back()) {
-        for h in first..=last {
-            let per = hours.get(&h).copied().unwrap_or_default();
-            let mut cells = String::new();
-            let mut used = 0;
-            for k in Kind::ALL {
-                let n = (per[k.index()] / 120.0).round() as usize;
-                used += n;
-                cells += &st.kind(k, &"█".repeat(n));
-            }
-            let busy: f64 = per.iter().sum();
-            let tail = if busy > 0.0 { st.dim(&fmt_duration(busy)) } else { String::new() };
-            line!("  {h:02}  {cells}{} {tail}", " ".repeat(30usize.saturating_sub(used)));
+    let per_hour = hourly(acts);
+    let hours = match (per_hour.keys().next(), per_hour.keys().next_back()) {
+        (Some(&first), Some(&last)) => {
+            (first..=last).map(|h| (h, per_hour.get(&h).copied().unwrap_or_default())).collect()
         }
-    }
+        _ => Vec::new(),
+    };
 
-    // Top windows.
     let mut by_label: HashMap<(String, String), f64> = HashMap::new();
     for a in acts {
         *by_label.entry((short_label(a), a.category.clone())).or_default() += a.seconds();
     }
-    line!();
-    line!("{}", st.bold("🔝 最常用"));
-    for ((label, cat), sec) in ranked(&by_label).into_iter().take(8) {
-        line!("  {:>7}  {label}  {}", fmt_duration(sec), st.dim(&cat));
-    }
+    let top = ranked(&by_label).into_iter().take(8).map(|((l, c), s)| (l, c, s)).collect();
 
-    // Uncategorized: help the user refine the config.
     let mut unc: HashMap<String, f64> = HashMap::new();
     for a in acts.iter().filter(|a| a.category == UNCATEGORIZED) {
         let title: String = a.title.chars().take(60).collect();
         *unc.entry(format!("{} | {title}", a.app)).or_default() += a.seconds();
     }
-    if !unc.is_empty() {
+    let uncategorized = ranked(&unc).into_iter().take(5).collect();
+
+    DayReport {
+        day,
+        total,
+        by_kind,
+        kinds,
+        sessions,
+        min_session_min: settings.min_session_min,
+        max_interruption_min: settings.max_interruption_min,
+        rests: (rests.len(), rests.iter().map(|r| seconds(r.end - r.start)).sum()),
+        projects,
+        code,
+        categories,
+        hours,
+        top,
+        uncategorized,
+    }
+}
+
+/// Render the report for one day as terminal text.
+pub fn render(r: &DayReport, color: bool) -> String {
+    let st = Style { on: color };
+    let mut o = String::new();
+    // `writeln!` into a String cannot fail.
+    macro_rules! line { ($($t:tt)*) => { let _ = writeln!(o, $($t)*); } }
+
+    line!("{}", st.bold(&format!("📅 {}（週{}）", r.day.format("%Y-%m-%d"), r.weekday())));
+    if !r.has_data() {
+        line!("這天還沒有足夠的活動紀錄。");
+        return o;
+    }
+    let total = r.total;
+    let kinds: Vec<String> = r
+        .kinds
+        .iter()
+        .map(|&k| {
+            let s = r.by_kind[k.index()];
+            st.kind(k, &format!("{} {}（{:.0}%）", k.label(), fmt_duration(s), s / total * 100.0))
+        })
+        .collect();
+    line!("活躍 {}   {}", st.bold(&fmt_duration(total)), kinds.join("   "));
+
+    // Focus sessions.
+    line!();
+    let head = st.bold(&format!("🎯 專注時段 {} 個", r.sessions.len()));
+    if r.sessions.is_empty() {
+        line!(
+            "{head}{}",
+            st.dim(&format!(
+                "（累積專注 ≥ {} 分鐘、中斷 < {} 分鐘才算）",
+                r.min_session_min, r.max_interruption_min
+            ))
+        );
+    } else {
+        let sum: f64 = r.sessions.iter().map(|s| s.focus).sum();
+        line!("{head}，共 {}", fmt_duration(sum));
+    }
+    for s in &r.sessions {
+        let goal = s.goal.as_ref().map_or(String::new(), |g| format!("  🎯 {g}"));
+        let project = s.project.as_ref().map_or(String::new(), |p| format!("[{p}] "));
+        line!(
+            "  {}–{}  {:>7} 專注 / {:>7}  {project}{} · {}{}",
+            s.start,
+            s.end,
+            fmt_duration(s.focus),
+            fmt_duration(s.span),
+            s.category,
+            s.label,
+            st.bold(&goal)
+        );
+    }
+    if r.rests.0 > 0 {
+        line!("{}", st.kind(Kind::Rest, &format!("☕ 強制休息 {} 次，共 {}", r.rests.0, fmt_duration(r.rests.1))));
+    }
+
+    if !r.projects.is_empty() {
+        line!();
+        line!("{}", st.bold("📁 專案"));
+        let focus_total = r.by_kind[Kind::Focus.index()].max(1.0);
+        let width = r.projects.iter().map(|(n, ..)| n.width()).max().unwrap_or(0);
+        for (name, focus, all) in &r.projects {
+            let pad = " ".repeat(width - name.width());
+            line!(
+                "  {name}{pad}  {} 專注 {:>7}  {}",
+                st.kind(Kind::Focus, &bar(focus / focus_total, 16)),
+                fmt_duration(*focus),
+                st.dim(&format!("（含其他活動共 {}）", fmt_duration(*all)))
+            );
+        }
+    }
+
+    if !r.code.is_empty() {
+        line!();
+        line!("{}", st.bold("🤖 Claude Code sessions"));
+        for (name, project, sec) in &r.code {
+            let name: String = name.chars().take(40).collect();
+            let tag = if project.is_empty() { String::new() } else { format!("  [{project}]") };
+            line!("  {:>7}  {name}{}", fmt_duration(*sec), st.dim(&tag));
+        }
+    }
+
+    line!();
+    line!("{}", st.bold("📊 分類"));
+    let width = r.categories.iter().map(|(c, ..)| c.width()).max().unwrap_or(0);
+    for (cat, kind, sec) in &r.categories {
+        let pad = " ".repeat(width - cat.width());
+        line!(
+            "  {cat}{pad}  {} {:>7}  {:>3.0}%",
+            st.kind(*kind, &bar(sec / total, 20)),
+            fmt_duration(*sec),
+            sec / total * 100.0
+        );
+    }
+
+    // Hourly timeline, 2 minutes per character.
+    let legend: Vec<String> = r.kinds.iter().map(|&k| st.kind(k, &format!("█{}", k.label()))).collect();
+    line!();
+    line!("{}  {}", st.bold("🕐 每小時"), legend.join(" "));
+    for (h, per) in &r.hours {
+        let mut cells = String::new();
+        let mut used = 0;
+        for k in Kind::ALL {
+            let n = (per[k.index()] / 120.0).round() as usize;
+            used += n;
+            cells += &st.kind(k, &"█".repeat(n));
+        }
+        let busy: f64 = per.iter().sum();
+        let tail = if busy > 0.0 { st.dim(&fmt_duration(busy)) } else { String::new() };
+        line!("  {h:02}  {cells}{} {tail}", " ".repeat(30usize.saturating_sub(used)));
+    }
+
+    line!();
+    line!("{}", st.bold("🔝 最常用"));
+    for (label, cat, sec) in &r.top {
+        line!("  {:>7}  {label}  {}", fmt_duration(*sec), st.dim(cat));
+    }
+
+    // Uncategorized: help the user refine the config.
+    if !r.uncategorized.is_empty() {
         line!();
         line!("{}", st.bold("❓ 未分類（可加進設定檔的規則）"));
-        for (label, sec) in ranked(&unc).into_iter().take(5) {
-            line!("  {:>7}  {label}", fmt_duration(sec));
+        for (label, sec) in &r.uncategorized {
+            line!("  {:>7}  {label}", fmt_duration(*sec));
         }
     }
     o.truncate(o.trim_end().len());

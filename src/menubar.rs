@@ -50,6 +50,7 @@ use crate::categorize::{Categorizer, Kind};
 use crate::client::AwClient;
 use crate::config::Settings;
 use crate::journal::{self, Entry, Rest};
+use crate::reportwin::ReportController;
 use crate::sound::{self, Choice, Player};
 use crate::sisyphus::{self, ICON_H, ICON_W, Prim, Scene};
 use crate::tracker::{self, Snapshot};
@@ -167,6 +168,7 @@ struct TargetIvars {
     /// Set after construction; used to pop the menu up on right-click.
     status_item: RefCell<Option<Retained<NSStatusItem>>>,
     menu: RefCell<Option<Retained<NSMenu>>>,
+    report: Retained<ReportController>,
 }
 
 define_class!(
@@ -256,14 +258,7 @@ define_class!(
 
         #[unsafe(method(openReport:))]
         fn open_report(&self, _sender: Option<&AnyObject>) {
-            // Show the daily report in a new Terminal window.
-            let exe = std::env::current_exe().unwrap_or_else(|_| "aw-timer".into());
-            let cmd = format!("'{}' report -i", exe.display().to_string().replace('\'', r"'\''"));
-            let _ = Command::new("osascript")
-                .args(["-e", "on run argv", "-e",
-                       "tell application \"Terminal\" to do script (item 1 of argv)",
-                       "-e", "tell application \"Terminal\" to activate", "-e", "end run", &cmd])
-                .status();
+            self.ivars().report.show();
         }
     }
 );
@@ -274,6 +269,7 @@ impl MenuTarget {
         poke: Sender<()>,
         projects: Vec<String>,
         sound: &sound::SoundSettings,
+        config_path: Option<String>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TargetIvars {
             poke,
@@ -283,6 +279,7 @@ impl MenuTarget {
             player: RefCell::new(Player::new(sound.clone())),
             status_item: RefCell::new(None),
             menu: RefCell::new(None),
+            report: ReportController::new(mtm, config_path),
         });
         // SAFETY: plain NSObject initializer.
         unsafe { msg_send![super(this), init] }
@@ -297,6 +294,19 @@ impl MenuTarget {
             eprintln!("journal write failed: {e}");
         }
         let _ = self.ivars().poke.send(());
+    }
+}
+
+/// Bring this (accessory) app to the front.
+pub(crate) fn activate(mtm: MainThreadMarker) {
+    let app = NSApplication::sharedApplication(mtm);
+    // `activate` is macOS 14+; older systems only have the (since
+    // deprecated) `activateIgnoringOtherApps:`.
+    if app.respondsToSelector(sel!(activate)) {
+        app.activate();
+    } else {
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
     }
 }
 
@@ -319,15 +329,7 @@ fn ask_goal(mtm: MainThreadMarker, current: &str) -> Option<String> {
     alert.setAccessoryView(Some(&field));
     alert.window().setInitialFirstResponder(Some(&field));
     // An accessory app is never frontmost on its own; bring the dialog up.
-    let app = NSApplication::sharedApplication(mtm);
-    // `activate` is macOS 14+; older systems only have the (since
-    // deprecated) `activateIgnoringOtherApps:`.
-    if app.respondsToSelector(sel!(activate)) {
-        app.activate();
-    } else {
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
-    }
+    activate(mtm);
     match alert.runModal() {
         r if r == NSAlertFirstButtonReturn => Some(field.stringValue().to_string().trim().to_owned()),
         r if r == NSAlertSecondButtonReturn => Some(String::new()),
@@ -632,6 +634,7 @@ pub fn run(
     mut categorizer: Categorizer,
     verbose: bool,
     reload: impl FnMut() -> Option<Categorizer> + Send + 'static,
+    config_path: Option<String>,
 ) -> ! {
     let mtm = MainThreadMarker::new().expect("menu bar must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -657,7 +660,7 @@ pub fn run(
 
     let item: Retained<NSStatusItem> =
         NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
-    let target = MenuTarget::new(mtm, poke_tx, project_names.clone(), &settings.sound);
+    let target = MenuTarget::new(mtm, poke_tx, project_names.clone(), &settings.sound, config_path);
     let menu = NSMenu::new(mtm);
     menu.setAutoenablesItems(false);
     let info = |title: &str| {
@@ -759,7 +762,7 @@ pub fn run(
     rest_parent.setSubmenu(Some(&rest_menu));
     let end_rest = action("🪨 結束休息，回去推石頭", sel!(endRest:), "e");
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    action("今日報表與分類…", sel!(openReport:), "r");
+    action("📊 報表與分類…", sel!(openReport:), "r");
     action("開啟 ActivityWatch", sel!(openDashboard:), "d");
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     // SAFETY: `terminate:` is handled by NSApplication via the responder chain.
