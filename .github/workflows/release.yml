@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       # Oldest macOS the binary may run on (see README "Requirements").
       MACOSX_DEPLOYMENT_TARGET: "11.0"
