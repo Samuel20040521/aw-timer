@@ -6,6 +6,21 @@
 	<string>local.aw-timer</string>
 	<key>CFBundleName</key>
 	<string>aw-timer</string>
+	<key>CFBundleDisplayName</key>
+	<string>aw-timer</string>
+	<key>CFBundleExecutable</key>
+	<string>aw-timer</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<!-- Menu bar only: no Dock icon. -->
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>aw-timer 會把你的行程顯示在報表時間線旁邊，和你的專注時間對照。行程只在本機讀取，不會上傳。</string>
 	<key>NSCalendarsUsageDescription</key>

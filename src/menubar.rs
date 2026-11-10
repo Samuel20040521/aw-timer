@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Bool};
+use objc2::runtime::{AnyObject, Bool, ProtocolObject};
 use objc2::{AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSControlStateValueOff, NSControlStateValueOn, NSEventMask,
@@ -41,6 +41,10 @@ use objc2_foundation::{
     NSArray, NSAttributedStringKey, NSDictionary, NSObject, NSPoint, NSRect, NSSize, NSString,
     NSTimer, ns_string,
 };
+use objc2_user_notifications::{
+    UNNotification, UNNotificationPresentationOptions, UNNotificationResponse, UNUserNotificationCenter,
+    UNUserNotificationCenterDelegate,
+};
 use objc2_quartz_core::{
     CACurrentMediaTime, CAKeyframeAnimation, CALayer, CAMediaTiming, CATransaction, kCAAnimationDiscrete,
     kCAFillModeForwards,
@@ -50,6 +54,7 @@ use crate::categorize::{Categorizer, Kind};
 use crate::client::AwClient;
 use crate::config::Settings;
 use crate::journal::{self, Entry, Rest};
+use crate::notify;
 use crate::reportwin::ReportController;
 use crate::sound::{self, Choice, Player};
 use crate::sisyphus::{self, ICON_H, ICON_W, Prim, Scene};
@@ -294,6 +299,72 @@ impl MenuTarget {
             eprintln!("journal write failed: {e}");
         }
         let _ = self.ivars().poke.send(());
+    }
+}
+
+/// The menu target, reachable from the notification delegate's thread.
+struct TargetPtr(*const AnyObject);
+// SAFETY: the pointer is only used for `performSelectorOnMainThread:…`,
+// which is thread-safe, and the target lives as long as the process
+// (`run` never returns).
+unsafe impl Send for TargetPtr {}
+// SAFETY: as above; the pointer is never dereferenced off the main thread.
+unsafe impl Sync for TargetPtr {}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements and we add no Drop.
+    #[unsafe(super(NSObject))]
+    #[name = "AwTimerNotificationDelegate"]
+    #[ivars = TargetPtr]
+    struct NotificationDelegate;
+
+    unsafe impl NSObjectProtocol for NotificationDelegate {}
+
+    unsafe impl UNUserNotificationCenterDelegate for NotificationDelegate {
+        /// Show banners even while the report window is in front.
+        #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
+        fn will_present(
+            &self,
+            _center: &UNUserNotificationCenter,
+            _notification: &UNNotification,
+            completion: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
+        ) {
+            completion.call((UNNotificationPresentationOptions::Banner
+                | UNNotificationPresentationOptions::List
+                | UNNotificationPresentationOptions::Sound,));
+        }
+
+        /// A click on any aw-timer notification opens the report window.
+        #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+        fn did_receive(
+            &self,
+            _center: &UNUserNotificationCenter,
+            _response: &UNNotificationResponse,
+            completion: &block2::DynBlock<dyn Fn()>,
+        ) {
+            let target = self.ivars().0;
+            // SAFETY: `target` is the MenuTarget (alive for the whole
+            // process), which implements openReport:; this hop to the main
+            // thread is safe from any thread.
+            unsafe {
+                let _: () = msg_send![
+                    target,
+                    performSelectorOnMainThread: sel!(openReport:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    waitUntilDone: false
+                ];
+            }
+            completion.call(());
+        }
+    }
+);
+
+impl NotificationDelegate {
+    fn new(target: &MenuTarget) -> Retained<Self> {
+        let ptr: *const AnyObject = (target as &AnyObject) as *const AnyObject;
+        let this = Self::alloc().set_ivars(TargetPtr(ptr));
+        // SAFETY: plain NSObject initializer.
+        unsafe { msg_send![super(this), init] }
     }
 }
 
@@ -661,6 +732,13 @@ pub fn run(
     let item: Retained<NSStatusItem> =
         NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     let target = MenuTarget::new(mtm, poke_tx, project_names.clone(), &settings.sound, config_path);
+    // Clicking a notification opens the report (app bundle only; see notify).
+    let _notification_delegate = notify::bundled().then(|| {
+        let delegate = NotificationDelegate::new(&target);
+        UNUserNotificationCenter::currentNotificationCenter().setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        notify::request_authorization();
+        delegate
+    });
     let menu = NSMenu::new(mtm);
     menu.setAutoenablesItems(false);
     let info = |title: &str| {

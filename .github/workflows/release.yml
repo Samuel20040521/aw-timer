@@ -53,7 +53,7 @@ jobs:
 
       - name: Package
         run: |
-          cp install.sh uninstall.sh default_config.toml README.md README.zh-TW.md LICENSE "$PKG/"
+          cp install.sh uninstall.sh default_config.toml Info.plist README.md README.zh-TW.md LICENSE "$PKG/"
           tar czf "$PKG.tar.gz" "$PKG"
           shasum -a 256 "$PKG.tar.gz" > "$PKG.tar.gz.sha256"
           cat "$PKG.tar.gz.sha256"

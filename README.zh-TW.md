@@ -20,6 +20,7 @@
   - 距上次休息滿 50 分鐘提醒休息（用電腦的時間都算，不只專注）；
   - 連續分心 10 分鐘提醒你回到正軌；
   - 進入專注時段時通知鼓勵。
+  - 點任何一則通知都會打開報表視窗。
 - **強制休息**：可選 5、10、15、30 分鐘，或不限時、手動結束。
 - **專注目標**：自己打字設定，會顯示在選單、通知和報表裡。
 - **專案**：依視窗標題規則、[Claude Code](https://claude.com/claude-code) session 的工作資料夾，或選單手動選擇，把時間歸到專案。
@@ -74,7 +75,7 @@
    ```
 
    安裝程式會：
-   - 把執行檔放到 `~/Library/Application Support/aw-timer/`；
+   - 把只在選單列出現的 `aw-timer.app`（沒有 Dock 圖示）裝到 `~/Library/Application Support/aw-timer/`；
    - 建立 `~/.local/bin/aw-timer` 指令；
    - 在 `~/.config/aw-timer/config.toml` 建立設定檔，已經有的話不會覆蓋；
    - 註冊 LaunchAgent，登入時自動啟動。

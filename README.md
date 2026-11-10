@@ -22,6 +22,7 @@ All tracking data stays on your Mac. No account, no cloud.
   - A break reminder after 50 minutes at the computer since your last real break (any activity counts, not just focus).
   - Get back on track after 10 minutes of distraction.
   - A message when a focus session starts.
+  - Click any notification to open the report window.
 - **Forced breaks** of 5, 10, 15 or 30 minutes, or until you end them.
 - **Focus goal** that you type in. It appears in the menu, in notifications and in the report.
 - **Projects.** Time is assigned to a project by window-title rules, by the working folder of your [Claude Code](https://claude.com/claude-code) session, or by a project you pick from the menu.
@@ -76,7 +77,7 @@ All tracking data stays on your Mac. No account, no cloud.
    ```
 
    The installer does the following:
-   - copies the binary to `~/Library/Application Support/aw-timer/`;
+   - installs a menu-bar-only `aw-timer.app` (no Dock icon) in `~/Library/Application Support/aw-timer/`;
    - links it to `~/.local/bin/aw-timer`;
    - creates `~/.config/aw-timer/config.toml`, but only if you don't already have one;
    - registers a LaunchAgent so aw-timer starts at login.

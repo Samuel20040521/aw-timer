@@ -12,7 +12,9 @@ CONF_DIR="${HOME}/.config/aw-timer"
 BIN_LINK="${HOME}/.local/bin/aw-timer"
 PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 LOG="${HOME}/Library/Logs/aw-timer.log"
-EXE="${APP_DIR}/aw-timer"
+# A minimal app bundle: macOS only routes notification clicks back to apps.
+APP="${APP_DIR}/aw-timer.app"
+EXE="${APP}/Contents/MacOS/aw-timer"
 
 # Release archives ship a prebuilt universal binary next to this script;
 # a source checkout builds one with cargo.
@@ -28,11 +30,17 @@ mkdir -p "${APP_DIR}" "${CONF_DIR}" "$(dirname "${BIN_LINK}")" \
          "$(dirname "${PLIST}")" "$(dirname "${LOG}")"
 # Stop the running agent before replacing its executable.
 launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
+rm -rf "${APP}"
+mkdir -p "${APP}/Contents/MacOS"
 install -m 755 "${BUILT}" "${EXE}"
-# Re-sign so the embedded Info.plist is bound to the signature; macOS needs
-# it to show the Calendar permission prompt.
-codesign --force --sign - "${EXE}" 2>/dev/null || true
-rm -rf "${APP_DIR}/aw_timer"   # leftover Python package, if any
+cp "${SRC}/Info.plist" "${APP}/Contents/Info.plist"
+# Sign the bundle (ad hoc) so its Info.plist is bound to the signature;
+# macOS needs it for the Calendar and notification permission prompts.
+codesign --force --sign - "${APP}" 2>/dev/null || true
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "${APP}" 2>/dev/null || true
+# Leftovers of older installs: the bare binary and the Python package.
+rm -rf "${APP_DIR}/aw-timer" "${APP_DIR}/aw_timer"
 
 # Never overwrite a config the user has already edited.
 if [[ ! -f "${CONF_DIR}/config.toml" ]]; then

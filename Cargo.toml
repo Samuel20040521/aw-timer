@@ -18,6 +18,7 @@ objc2-core-graphics = "0.3"
 objc2-event-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "EKCalendar", "EKCalendarItem", "EKEvent", "EKEventStore", "EKObject", "EKSource", "EKTypes"] }
 objc2-foundation = "0.3"
 objc2-quartz-core = "0.3"
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationRequest", "UNNotificationContent", "UNNotificationResponse", "UNNotification", "UNNotificationSound", "UNNotificationTrigger", "UNNotificationSettings"] }
 regex = "1.13.1"
 rodio = { version = "0.23.0", default-features = false, features = ["playback"] }
 serde = { version = "1.0.229", features = ["derive"] }
