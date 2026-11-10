@@ -43,13 +43,8 @@ jobs:
           # Ad-hoc signature (no Developer ID); required to run on Apple Silicon.
           codesign --force --sign - "$PKG/aw-timer"
           lipo -info "$PKG/aw-timer"
-          # Fail if the deployment target drifted or a newer-than-11.0 CoreAudio
-          # symbol became a strong import again (see build.rs).
-          otool -l "$PKG/aw-timer" | grep -A3 LC_BUILD_VERSION | grep -q "minos 11.0"
-          if nm -m "$PKG/aw-timer" | grep "ProcessTap" | grep -qv "weak external"; then
-            echo "::error::CoreAudio ProcessTap symbols are strongly linked (macOS 14.2+ only)"; exit 1
-          fi
-          "$PKG/aw-timer" --help > /dev/null
+          scripts/ci/check-binary.sh "$PKG/aw-timer"
+          scripts/ci/check-bundle.sh "$PKG/aw-timer"
 
       - name: Package
         run: |
