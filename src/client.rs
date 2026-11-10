@@ -1,7 +1,7 @@
 //! Minimal ActivityWatch REST client.
 
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -57,11 +57,15 @@ struct RawData {
     title: String,
 }
 
+/// How long the bucket list is reused before asking the server again.
+const BUCKETS_TTL: Duration = Duration::from_secs(60);
+
 /// Thin wrapper around the aw-server API (`/api/0`).
 pub struct AwClient {
     base: String,
     agent: ureq::Agent,
-    bucket_ids: Option<(String, String)>,
+    /// `(window bucket ids, afk bucket ids, when fetched)`.
+    buckets: Option<(Vec<String>, Vec<String>, Instant)>,
 }
 
 impl AwClient {
@@ -73,7 +77,7 @@ impl AwClient {
         Self {
             base: format!("{}/api/0", base_url.trim_end_matches('/')),
             agent,
-            bucket_ids: None,
+            buckets: None,
         }
     }
 
@@ -81,32 +85,37 @@ impl AwClient {
         Ok(self.agent.get(&format!("{}{path}", self.base)).call()?.into_json()?)
     }
 
-    /// Find `(window_bucket_id, afk_bucket_id)` for this host (cached).
-    fn resolve_buckets(&mut self) -> Result<(String, String), Unavailable> {
-        if let Some(ids) = &self.bucket_ids {
-            return Ok(ids.clone());
+    /// Every window and AFK bucket, cached for [`BUCKETS_TTL`].
+    ///
+    /// ActivityWatch names buckets after the hostname, and macOS changes the
+    /// hostname with the network (e.g. `Mac.localdomain` →
+    /// `…-MacBook-Air.local`), starting new buckets. Reading all of them
+    /// keeps the history from before the change.
+    fn resolve_buckets(&mut self) -> Result<(Vec<String>, Vec<String>), Unavailable> {
+        if let Some((win, afk, at)) = &self.buckets
+            && at.elapsed() < BUCKETS_TTL
+        {
+            return Ok((win.clone(), afk.clone()));
         }
-        let hostname = self.get("/info")?["hostname"].as_str().unwrap_or("").to_owned();
         let buckets = self.get("/buckets/")?;
         let all = buckets
             .as_object()
             .ok_or_else(|| Unavailable("unexpected /buckets/ response".into()))?;
-        let pick = |bucket_type: &str| -> Result<String, Unavailable> {
-            let mut candidates: Vec<&Value> =
-                all.values().filter(|b| b["type"] == bucket_type).collect();
-            // Prefer the bucket belonging to this machine (false sorts first).
-            candidates.sort_by_key(|b| b["hostname"].as_str() != Some(hostname.as_str()));
-            candidates
-                .first()
-                .and_then(|b| b["id"].as_str())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    Unavailable(format!("no '{bucket_type}' bucket yet; is ActivityWatch running?"))
-                })
+        let pick = |bucket_type: &str| -> Result<Vec<String>, Unavailable> {
+            let mut ids: Vec<String> = all
+                .values()
+                .filter(|b| b["type"] == bucket_type)
+                .filter_map(|b| b["id"].as_str().map(str::to_owned))
+                .collect();
+            ids.sort();
+            if ids.is_empty() {
+                return Err(Unavailable(format!("no '{bucket_type}' bucket yet; is ActivityWatch running?")));
+            }
+            Ok(ids)
         };
-        let ids = (pick("currentwindow")?, pick("afkstatus")?);
-        self.bucket_ids = Some(ids.clone());
-        Ok(ids)
+        let (win, afk) = (pick("currentwindow")?, pick("afkstatus")?);
+        self.buckets = Some((win.clone(), afk.clone(), Instant::now()));
+        Ok((win, afk))
     }
 
     /// Window events overlapping non-AFK time in `[start, end)`.
@@ -118,16 +127,8 @@ impl AwClient {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<WindowEvent>, Unavailable> {
-        let (window_id, afk_id) = self.resolve_buckets()?;
-        // serde_json::to_string yields a correctly escaped string literal.
-        let lit = |s: &str| serde_json::to_string(s).expect("string serialization");
-        let query = [
-            format!("afk = flood(query_bucket({}));", lit(&afk_id)),
-            format!("win = flood(query_bucket({}));", lit(&window_id)),
-            r#"not_afk = filter_keyvals(afk, "status", ["not-afk"]);"#.to_owned(),
-            "win = filter_period_intersect(win, not_afk);".to_owned(),
-            "RETURN = sort_by_timestamp(win);".to_owned(),
-        ];
+        let (window_ids, afk_ids) = self.resolve_buckets()?;
+        let query = merged_query(&window_ids, &afk_ids);
         let body = json!({
             "timeperiods": [format!("{}/{}", start.to_rfc3339(), end.to_rfc3339())],
             "query": query,
@@ -154,5 +155,36 @@ impl AwClient {
             });
         }
         Ok(events)
+    }
+}
+
+/// Query joining all window buckets and all AFK buckets, keeping window
+/// events that overlap non-AFK time.
+fn merged_query(window_ids: &[String], afk_ids: &[String]) -> Vec<String> {
+    // serde_json::to_string yields a correctly escaped string literal.
+    let lit = |s: &str| serde_json::to_string(s).expect("string serialization");
+    let mut q = Vec::new();
+    for (var, ids) in [("afk", afk_ids), ("win", window_ids)] {
+        for (i, id) in ids.iter().enumerate() {
+            let events = format!("flood(query_bucket({}))", lit(id));
+            q.push(if i == 0 { format!("{var} = {events};") } else { format!("{var} = concat({var}, {events});") });
+        }
+    }
+    q.push(r#"not_afk = filter_keyvals(afk, "status", ["not-afk"]);"#.to_owned());
+    q.push("win = filter_period_intersect(win, not_afk);".to_owned());
+    q.push("RETURN = sort_by_timestamp(win);".to_owned());
+    q
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_query_concats_every_bucket() {
+        let q = merged_query(&["w1".into(), "w2".into()], &["a1".into()]);
+        assert_eq!(q[0], r#"afk = flood(query_bucket("a1"));"#);
+        assert_eq!(q[2], r#"win = concat(win, flood(query_bucket("w2")));"#);
+        assert!(q.last().unwrap().starts_with("RETURN"));
     }
 }
