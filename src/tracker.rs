@@ -57,6 +57,7 @@ pub fn load_activities(
                 app: ev.app,
                 title: ev.title,
                 project: None,
+                task: None,
                 detail: None,
             }
         })
@@ -81,6 +82,8 @@ pub struct Snapshot {
     pub goal: Option<String>,
     /// Project selected manually from the menu, if any.
     pub manual_project: Option<String>,
+    /// Task selected manually from the menu, if any.
+    pub manual_task: Option<String>,
 }
 
 impl Snapshot {
@@ -224,6 +227,21 @@ pub fn assign_projects(
             if p.project.is_none() {
                 p.project = cat.project_for(&p.app, &p.title).map(str::to_owned);
             }
+            // Tasks: keywords first; otherwise the task picked in the menu
+            // (focused time only). A task's project fills in a missing one.
+            if let Some((task, project)) = cat.task_for(&p.app, &p.title) {
+                p.task = Some(task.to_owned());
+                if let Some(project) = project {
+                    p.project = Some(project.to_owned());
+                }
+            } else if p.kind == Kind::Focus
+                && let Some(task) = journal::task_at(entries, p.start)
+            {
+                if p.project.is_none() {
+                    p.project = cat.task_project(&task).map(str::to_owned);
+                }
+                p.task = Some(task);
+            }
             if p.project.is_none() && p.kind == Kind::Focus {
                 p.project = journal::project_at(entries, p.start);
             }
@@ -271,6 +289,7 @@ pub fn build_snapshot(
         rest,
         goal,
         manual_project,
+        manual_task: None,
         now,
         activities,
     }
@@ -313,7 +332,9 @@ pub fn snapshot(
     let (start, end) = day_bounds(now.with_timezone(&Local).date_naive());
     let (acts, rests, entries) = load_day(client, categorizer, code, start, end)?;
     let (goal, project) = (journal::goal_at(&entries, now), journal::project_at(&entries, now));
-    Ok(build_snapshot(acts, settings, now, &rests, goal, project))
+    let mut snap = build_snapshot(acts, settings, now, &rests, goal, project);
+    snap.manual_task = journal::task_at(&entries, now);
+    Ok(snap)
 }
 
 /// Decides which notifications to send; remembers what it already sent.
@@ -567,5 +588,24 @@ mod tests {
         let out: HashMap<_, _> = n.decide(&snap(41.0, acts.clone())).into_iter().collect();
         assert!(out["回到正軌 👀"].contains("lofi"));
         assert!(n.decide(&snap(41.5, acts)).is_empty());
+    }
+
+    #[test]
+    fn tasks_by_keyword_or_manual_pick_fill_in_their_project() {
+        let extra = crate::config::ProjectsFile {
+            project: vec![crate::categorize::ProjectRule { name: "QAE".into(), paths: Vec::new(), pattern: None }],
+            task: vec![
+                crate::categorize::TaskRule { name: "Paper".into(), project: Some("QAE".into()), pattern: Some("overleaf".into()) },
+                crate::categorize::TaskRule { name: "Reading".into(), project: Some("QAE".into()), pattern: None },
+            ],
+        };
+        let (_, cat) = crate::config::parse_with(crate::config::DEFAULT_CONFIG, Vec::new(), extra).unwrap();
+        let mut by_kw = act(0.0, 10.0, Kind::Focus, "文件寫作");
+        by_kw.title = "Overleaf - main.tex".into();
+        let manual = act(10.0, 10.0, Kind::Focus, "寫程式");
+        let entries = vec![Entry::Task { t: t0(), name: "Reading".into() }];
+        let out = assign_projects(vec![by_kw, manual], &cat, &CodeIndex::default(), &entries);
+        assert_eq!((out[0].task.as_deref(), out[0].project.as_deref()), (Some("Paper"), Some("QAE")));
+        assert_eq!((out[1].task.as_deref(), out[1].project.as_deref()), (Some("Reading"), Some("QAE")));
     }
 }

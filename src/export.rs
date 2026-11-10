@@ -35,6 +35,7 @@ pub struct Segment {
     pub app: String,
     pub label: String,
     pub project: String,
+    pub task: String,
 }
 
 /// Seconds per logical day and category.
@@ -108,6 +109,7 @@ pub fn segments(acts: Vec<Activity>) -> Vec<Segment> {
             app: o.act.app,
             label,
             project: o.act.project.unwrap_or_default(),
+            task: o.act.task.unwrap_or_default(),
         }
     };
     let mut out = Vec::new();
@@ -121,6 +123,7 @@ pub fn segments(acts: Vec<Activity>) -> Vec<Segment> {
                 && o.act.category == act.category
                 && o.act.app == act.app
                 && o.act.project == act.project
+                && o.act.task == act.task
                 && seconds(act.start - o.end) < MERGE_GAP_SECS;
             if same {
                 o.end = o.end.max(act.end);

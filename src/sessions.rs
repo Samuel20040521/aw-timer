@@ -26,6 +26,8 @@ pub struct Activity {
     pub kind: Kind,
     /// Project this time belongs to (rules, Claude Code cwd, or manual).
     pub project: Option<String>,
+    /// Task this time belongs to (task keywords or manual pick).
+    pub task: Option<String>,
     /// Extra context, e.g. the Claude Code session title.
     pub detail: Option<String>,
 }
@@ -230,6 +232,7 @@ pub(crate) mod tests {
             category: cat.into(),
             kind,
             project: None,
+            task: None,
             detail: None,
         }
     }

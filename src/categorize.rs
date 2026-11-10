@@ -70,17 +70,30 @@ pub struct Override {
     pub kind: Kind,
 }
 
-/// One `[[project]]` table from the config file.
-#[derive(Debug, Deserialize)]
+/// One `[[project]]` table (config file or `projects.toml`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRule {
     pub name: String,
     /// Folders (`~` allowed); a Claude Code session whose cwd is inside one
     /// belongs to this project.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
     /// Regex over `"app title"` (and over a session cwd as a fallback).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+}
+
+/// One `[[task]]` table: a piece of work, optionally inside a project.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRule {
+    pub name: String,
+    /// The project this task belongs to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Regex over `"app title"`; without one the task is picked by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
 }
 
@@ -89,6 +102,33 @@ struct Project {
     name: String,
     paths: Vec<String>,
     pattern: Option<Regex>,
+    pattern_src: String,
+}
+
+#[derive(Debug)]
+struct Task {
+    name: String,
+    project: Option<String>,
+    pattern: Option<Regex>,
+    pattern_src: String,
+}
+
+/// A project or task as listed in the UI: `(name, project, pattern)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub name: String,
+    /// For tasks: the parent project.
+    pub project: Option<String>,
+    /// The keyword regex as written ("" = none).
+    pub pattern: String,
+}
+
+fn compile(what: &str, name: &str, pattern: Option<&str>) -> Result<Option<Regex>, String> {
+    pattern
+        .filter(|x| !x.is_empty())
+        .map(|x| RegexBuilder::new(x).case_insensitive(true).build())
+        .transpose()
+        .map_err(|e| format!("{what} {name:?}: {e}"))
 }
 
 #[derive(Debug)]
@@ -112,6 +152,7 @@ pub struct Categorizer {
     rule_count: usize,
     overrides: Vec<(MatchOn, String, usize)>,
     projects: Vec<Project>,
+    tasks: Vec<Task>,
     by_app: HashMap<String, usize>,
     cache: HashMap<(String, String), usize>,
 }
@@ -128,25 +169,28 @@ impl Categorizer {
         rules: Vec<CategoryRule>,
         overrides: Vec<Override>,
         projects: Vec<ProjectRule>,
+        tasks: Vec<TaskRule>,
     ) -> Result<Self, String> {
         let home = std::env::var("HOME").unwrap_or_default();
+        let tasks = tasks
+            .into_iter()
+            .map(|t| {
+                let pattern = compile("task", &t.name, t.pattern.as_deref())?;
+                let pattern_src = t.pattern.unwrap_or_default();
+                Ok(Task { name: t.name, project: t.project.filter(|p| !p.is_empty()), pattern, pattern_src })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let projects = projects
             .into_iter()
             .map(|p| {
-                let pattern = p
-                    .pattern
-                    .as_deref()
-                    .filter(|x| !x.is_empty())
-                    .map(|x| RegexBuilder::new(x).case_insensitive(true).build())
-                    .transpose()
-                    .map_err(|e| format!("project {:?}: {e}", p.name))?;
+                let pattern = compile("project", &p.name, p.pattern.as_deref())?;
                 let paths = p
                     .paths
                     .iter()
                     .map(|x| x.strip_prefix('~').map_or_else(|| x.clone(), |rest| format!("{home}{rest}")))
                     .map(|x| x.trim_end_matches('/').to_owned())
                     .collect();
-                Ok(Project { name: p.name, paths, pattern })
+                Ok(Project { name: p.name, paths, pattern, pattern_src: p.pattern.unwrap_or_default() })
             })
             .collect::<Result<Vec<_>, String>>()?;
         let mut categories = Vec::with_capacity(rules.len() + overrides.len() + 1);
@@ -177,7 +221,7 @@ impl Categorizer {
             .collect();
         // Fallback lives at the last index.
         categories.push(Category { name: UNCATEGORIZED.into(), kind: Kind::Neutral, pattern: None });
-        Ok(Self { categories, rule_count, overrides, projects, by_app, cache: HashMap::new() })
+        Ok(Self { categories, rule_count, overrides, projects, tasks, by_app, cache: HashMap::new() })
     }
 
     /// Classify one event; results are memoized.
@@ -197,9 +241,35 @@ impl Categorizer {
         &self.categories[idx]
     }
 
-    /// Configured project names, in file order.
-    pub fn project_names(&self) -> Vec<String> {
-        self.projects.iter().map(|p| p.name.clone()).collect()
+
+    /// Every project, in file order (config file first).
+    pub fn projects(&self) -> Vec<Listed> {
+        self.projects
+            .iter()
+            .map(|p| Listed { name: p.name.clone(), project: None, pattern: p.pattern_src.clone() })
+            .collect()
+    }
+
+    /// Every task, in file order (config file first).
+    pub fn tasks(&self) -> Vec<Listed> {
+        self.tasks
+            .iter()
+            .map(|t| Listed { name: t.name.clone(), project: t.project.clone(), pattern: t.pattern_src.clone() })
+            .collect()
+    }
+
+    /// Task whose pattern matches `"app title"`, with its project.
+    pub fn task_for(&self, app: &str, title: &str) -> Option<(&str, Option<&str>)> {
+        let haystack = format!("{app} {title}");
+        self.tasks
+            .iter()
+            .find(|t| t.pattern.as_ref().is_some_and(|r| r.is_match(&haystack)))
+            .map(|t| (t.name.as_str(), t.project.as_deref()))
+    }
+
+    /// The project a task belongs to (`None` for unknown or loose tasks).
+    pub fn task_project(&self, task: &str) -> Option<&str> {
+        self.tasks.iter().find(|t| t.name == task).and_then(|t| t.project.as_deref())
     }
 
     /// Project whose pattern matches `"app title"`.

@@ -26,6 +26,8 @@ pub enum Entry {
     Goal { t: DateTime<Utc>, text: String },
     /// Set the current project manually; an empty `name` clears it.
     Project { t: DateTime<Utc>, name: String },
+    /// Set the current task manually; an empty `name` clears it.
+    Task { t: DateTime<Utc>, name: String },
 }
 
 impl Entry {
@@ -34,7 +36,8 @@ impl Entry {
             Entry::RestStart { t, .. }
             | Entry::RestEnd { t }
             | Entry::Goal { t, .. }
-            | Entry::Project { t, .. } => *t,
+            | Entry::Project { t, .. }
+            | Entry::Task { t, .. } => *t,
         }
     }
 }
@@ -102,7 +105,7 @@ pub fn rests(entries: &[Entry], now: DateTime<Utc>) -> Vec<Rest> {
                     close(&mut out, c, t);
                 }
             }
-            Entry::Goal { .. } | Entry::Project { .. } => {}
+            Entry::Goal { .. } | Entry::Project { .. } | Entry::Task { .. } => {}
         }
     }
     if let Some((start, planned)) = cur {
@@ -130,6 +133,14 @@ fn latest_same_day(entries: &[Entry], t: DateTime<Utc>, pick: impl Fn(&Entry) ->
 pub fn goal_at(entries: &[Entry], t: DateTime<Utc>) -> Option<String> {
     latest_same_day(entries, t, |e| match e {
         Entry::Goal { text, .. } => Some(text),
+        _ => None,
+    })
+}
+
+/// The manually selected task in effect at `t`.
+pub fn task_at(entries: &[Entry], t: DateTime<Utc>) -> Option<String> {
+    latest_same_day(entries, t, |e| match e {
+        Entry::Task { name, .. } => Some(name),
         _ => None,
     })
 }

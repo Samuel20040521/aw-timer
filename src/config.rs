@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
 
-use crate::categorize::{Categorizer, CategoryRule, Override, ProjectRule};
+use crate::categorize::{Categorizer, CategoryRule, Override, ProjectRule, TaskRule};
 use crate::sound::SoundSettings;
 
 pub const DEFAULT_CONFIG: &str = include_str!("../default_config.toml");
@@ -86,6 +86,8 @@ struct RawConfig {
     #[serde(default)]
     project: Vec<ProjectRule>,
     #[serde(default)]
+    task: Vec<TaskRule>,
+    #[serde(default)]
     sound: SoundSettings,
 }
 
@@ -93,10 +95,72 @@ struct RawConfig {
 ///
 /// # Errors
 /// Returns a message on TOML errors, unknown keys or bad regexes.
+#[cfg(test)]
 pub fn parse(text: &str, overrides: Vec<Override>) -> Result<(Settings, Categorizer), String> {
-    let raw: RawConfig = toml::from_str(text).map_err(|e| e.to_string())?;
+    parse_with(text, overrides, ProjectsFile::default())
+}
+
+/// Parse a config document plus the projects and tasks added from the
+/// report window. A project or task named like one in the config file is
+/// ignored (the config file wins).
+///
+/// # Errors
+/// Returns a message on TOML errors, unknown keys or bad regexes.
+pub fn parse_with(text: &str, overrides: Vec<Override>, extra: ProjectsFile) -> Result<(Settings, Categorizer), String> {
+    let mut raw: RawConfig = toml::from_str(text).map_err(|e| e.to_string())?;
     let settings = Settings { sound: raw.sound, ..raw.timer };
-    Ok((settings, Categorizer::from_rules(raw.category, overrides, raw.project)?))
+    for p in extra.project {
+        if !raw.project.iter().any(|q| q.name == p.name) {
+            raw.project.push(p);
+        }
+    }
+    for task in extra.task {
+        if !raw.task.iter().any(|q| q.name == task.name) {
+            raw.task.push(task);
+        }
+    }
+    Ok((settings, Categorizer::from_rules(raw.category, overrides, raw.project, raw.task)?))
+}
+
+/// Projects and tasks added from the report window (`projects.toml`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectsFile {
+    #[serde(default)]
+    pub project: Vec<ProjectRule>,
+    #[serde(default)]
+    pub task: Vec<TaskRule>,
+}
+
+pub fn projects_path() -> PathBuf {
+    config_dir().join("projects.toml")
+}
+
+/// Load `projects.toml`; a missing file means none.
+///
+/// # Errors
+/// Returns a message if the file exists but cannot be parsed.
+pub fn load_projects() -> Result<ProjectsFile, String> {
+    let path = projects_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProjectsFile::default()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Write `projects.toml`.
+///
+/// # Errors
+/// Returns a message on write failure.
+pub fn save_projects(file: &ProjectsFile) -> Result<(), String> {
+    let body = toml::to_string(file).map_err(|e| e.to_string())?;
+    let text = format!(
+        "# 由報表視窗的「設定」產生的專案與任務；config.toml 裡的同名項目優先。\n\n{body}"
+    );
+    let path = projects_path();
+    std::fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn config_dir() -> PathBuf {
@@ -181,7 +245,7 @@ pub fn save_hidden_calendars(hidden: &BTreeSet<String>) -> Result<(), String> {
 
 /// Files whose changes should make a running timer reload its categories.
 pub fn watched_files(explicit: Option<&str>) -> Vec<PathBuf> {
-    resolve_path(explicit).into_iter().chain([overrides_path()]).collect()
+    resolve_path(explicit).into_iter().chain([overrides_path(), projects_path()]).collect()
 }
 
 /// Where the config comes from: CLI flag > `$AW_TIMER_CONFIG` > user file
@@ -205,15 +269,16 @@ pub fn resolve_path(explicit: Option<&str>) -> Option<PathBuf> {
 /// Returns a human-readable message including the path.
 pub fn load(explicit: Option<&str>) -> Result<(Settings, Categorizer, String), String> {
     let overrides = load_overrides()?;
+    let extra = load_projects()?;
     match resolve_path(explicit) {
         Some(path) => {
             let shown = path.display().to_string();
             let text = std::fs::read_to_string(&path).map_err(|e| format!("{shown}: {e}"))?;
-            let (s, c) = parse(&text, overrides).map_err(|e| format!("{shown}: {e}"))?;
+            let (s, c) = parse_with(&text, overrides, extra).map_err(|e| format!("{shown}: {e}"))?;
             Ok((s, c, shown))
         }
         None => {
-            let (s, c) = parse(DEFAULT_CONFIG, overrides)?;
+            let (s, c) = parse_with(DEFAULT_CONFIG, overrides, extra)?;
             Ok((s, c, "（內建預設設定）".into()))
         }
     }

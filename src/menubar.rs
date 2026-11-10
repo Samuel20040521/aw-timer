@@ -31,7 +31,7 @@ use objc2_app_kit::{
     NSApplicationActivationPolicy, NSBezierPath, NSBitmapImageFileType, NSBitmapImageRep, NSColor,
     NSDeviceRGBColorSpace, NSFont, NSFontAttributeName, NSFontWeightSemibold,
     NSForegroundColorAttributeName, NSGraphicsContext, NSImage, NSLineCapStyle, NSLineJoinStyle,
-    NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem, NSStringDrawing,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem, NSStringDrawing,
     NSVariableStatusItemLength,
 };
 use objc2_core_foundation::{CFType, CGPoint, CGRect, CGSize};
@@ -52,7 +52,7 @@ use objc2_quartz_core::{
 
 use crate::categorize::{Categorizer, Kind};
 use crate::client::AwClient;
-use crate::config::Settings;
+use crate::config::{self, Settings};
 use crate::journal::{self, Entry, Rest};
 use crate::notify;
 use crate::reportwin::ReportController;
@@ -91,6 +91,7 @@ struct MenuState {
     rest: Option<Rest>,
     goal: Option<String>,
     manual_project: Option<String>,
+    manual_task: Option<String>,
     /// "📁 CVSD 1.2h · LSV 0.3h" (today's focus per project).
     projects_line: String,
 }
@@ -121,6 +122,7 @@ impl MenuState {
             rest: snap.rest,
             goal: snap.goal.clone(),
             manual_project: snap.manual_project.clone(),
+            manual_task: snap.manual_task.clone(),
             projects_line,
             phase: if working { Phase::Working } else { Phase::Resting },
             streak_secs: if working { streak } else { 0.0 },
@@ -142,6 +144,7 @@ impl MenuState {
             rest: None,
             goal: None,
             manual_project: None,
+            manual_task: None,
             projects_line: String::new(),
         }
     }
@@ -165,8 +168,12 @@ struct TargetIvars {
     poke: Sender<()>,
     /// Goal currently in effect (pre-fills the dialog).
     goal: RefCell<Option<String>>,
-    /// Project names; a menu item's tag indexes this (-1 = none).
-    projects: Vec<String>,
+    /// What the 📁 submenu's items pick; an item's tag indexes this
+    /// (-1 = none). Rebuilt each time the submenu opens.
+    picks: RefCell<Vec<Pick>>,
+    /// Manual project and task in effect (for the checkmarks).
+    manual: RefCell<(Option<String>, Option<String>)>,
+    config_path: Option<String>,
     /// Background sound catalog; a menu item's tag indexes this (-1 = off).
     choices: Vec<Choice>,
     player: RefCell<Player>,
@@ -174,6 +181,13 @@ struct TargetIvars {
     status_item: RefCell<Option<Retained<NSStatusItem>>>,
     menu: RefCell<Option<Retained<NSMenu>>>,
     report: Retained<ReportController>,
+}
+
+/// One choice in the 📁 submenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pick {
+    Project(String),
+    Task { name: String, project: Option<String> },
 }
 
 define_class!(
@@ -198,11 +212,22 @@ define_class!(
             self.record(Entry::RestEnd { t: chrono::Utc::now() });
         }
 
+        /// A 📁 submenu item: a project, a task (which also selects its
+        /// project), or "none" (tag -1) to clear both.
         #[unsafe(method(setProject:))]
         fn set_project(&self, sender: Option<&AnyObject>) {
             let tag = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()).map_or(-1, |m| m.tag());
-            let name = usize::try_from(tag).ok().and_then(|i| self.ivars().projects.get(i)).cloned();
-            self.record(Entry::Project { t: chrono::Utc::now(), name: name.unwrap_or_default() });
+            let pick = usize::try_from(tag).ok().and_then(|i| self.ivars().picks.borrow().get(i).cloned());
+            let (project, task) = match pick {
+                Some(Pick::Project(p)) => (p, String::new()),
+                Some(Pick::Task { name, project }) => (project.unwrap_or_default(), name),
+                None => (String::new(), String::new()),
+            };
+            let t = chrono::Utc::now();
+            if let Err(e) = journal::append(&Entry::Task { t, name: task }) {
+                eprintln!("journal write failed: {e}");
+            }
+            self.record(Entry::Project { t, name: project });
         }
 
         #[unsafe(method(playSound:))]
@@ -266,20 +291,32 @@ define_class!(
             self.ivars().report.show();
         }
     }
+
+    unsafe impl NSObjectProtocol for MenuTarget {}
+
+    unsafe impl NSMenuDelegate for MenuTarget {
+        /// Rebuild the 📁 submenu from the current projects and tasks
+        /// (they can change from the report window's settings).
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            self.rebuild_project_menu(menu);
+        }
+    }
 );
 
 impl MenuTarget {
     fn new(
         mtm: MainThreadMarker,
         poke: Sender<()>,
-        projects: Vec<String>,
         sound: &sound::SoundSettings,
         config_path: Option<String>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TargetIvars {
             poke,
             goal: RefCell::new(None),
-            projects,
+            picks: RefCell::new(Vec::new()),
+            manual: RefCell::new((None, None)),
+            config_path: config_path.clone(),
             choices: sound::catalog(sound),
             player: RefCell::new(Player::new(sound.clone())),
             status_item: RefCell::new(None),
@@ -288,6 +325,59 @@ impl MenuTarget {
         });
         // SAFETY: plain NSObject initializer.
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn rebuild_project_menu(&self, menu: &NSMenu) {
+        let mtm = MainThreadMarker::from(self);
+        let iv = self.ivars();
+        let (projects, tasks) = config::load(iv.config_path.as_deref())
+            .map(|(_, c, _)| (c.projects(), c.tasks()))
+            .unwrap_or_default();
+        let mut picks = Vec::new();
+        for p in &projects {
+            picks.push(Pick::Project(p.name.clone()));
+            for t in tasks.iter().filter(|t| t.project.as_deref() == Some(p.name.as_str())) {
+                picks.push(Pick::Task { name: t.name.clone(), project: Some(p.name.clone()) });
+            }
+        }
+        for t in tasks.iter().filter(|t| t.project.as_ref().is_none_or(|p| !projects.iter().any(|q| &q.name == p))) {
+            picks.push(Pick::Task { name: t.name.clone(), project: t.project.clone() });
+        }
+        let (cur_project, cur_task) = iv.manual.borrow().clone();
+        menu.removeAllItems();
+        let add = |title: &str, tag: isize, on: bool, indent: isize| {
+            // SAFETY: `self` implements setProject: and lives forever.
+            let it = unsafe {
+                let it = NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm), &NSString::from_str(title), Some(sel!(setProject:)), &NSString::new());
+                it.setTarget(Some(self));
+                it
+            };
+            it.setTag(tag);
+            it.setIndentationLevel(indent);
+            it.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
+            menu.addItem(&it);
+        };
+        let mut loose_header = false;
+        for (i, pick) in picks.iter().enumerate() {
+            match pick {
+                Pick::Project(name) => {
+                    let on = cur_task.is_none() && cur_project.as_deref() == Some(name.as_str());
+                    add(name, i as isize, on, 0);
+                }
+                Pick::Task { name, project } => {
+                    let in_project = project.as_ref().is_some_and(|p| projects.iter().any(|q| &q.name == p));
+                    if !in_project && !loose_header {
+                        menu.addItem(&NSMenuItem::separatorItem(mtm));
+                        loose_header = true;
+                    }
+                    add(name, i as isize, cur_task.as_deref() == Some(name.as_str()), if in_project { 1 } else { 0 });
+                }
+            }
+        }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        add("不指定", -1, cur_project.is_none() && cur_task.is_none(), 0);
+        *iv.picks.borrow_mut() = picks;
     }
 
     fn start_rest(&self, minutes: Option<f64>) {
@@ -712,7 +802,6 @@ pub fn run(
     // Accessory: no Dock icon, no app menu.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let project_names = categorizer.project_names();
     let shared = Arc::new(Mutex::new(MenuState::offline()));
     let (poke_tx, poke_rx) = mpsc::channel::<()>();
     {
@@ -731,7 +820,7 @@ pub fn run(
 
     let item: Retained<NSStatusItem> =
         NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
-    let target = MenuTarget::new(mtm, poke_tx, project_names.clone(), &settings.sound, config_path);
+    let target = MenuTarget::new(mtm, poke_tx, &settings.sound, config_path);
     // Clicking a notification opens the report (app bundle only; see notify).
     let _notification_delegate = notify::bundled().then(|| {
         let delegate = NotificationDelegate::new(&target);
@@ -769,24 +858,11 @@ pub fn run(
     };
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     action("🎯 設定專注目標…", sel!(setGoal:), "g");
-    // Project submenu: one item per configured project plus "none"; the
-    // checkmark follows the manual selection.
+    // Project submenu: projects with their tasks, rebuilt each time it opens
+    // (see `menuNeedsUpdate:`).
     let project_menu = NSMenu::new(mtm);
     project_menu.setAutoenablesItems(false);
-    let mut project_items = Vec::new();
-    for (i, name) in project_names.iter().map(String::as_str).chain(["不指定專案"]).enumerate() {
-        let tag = if i < project_names.len() { i as isize } else { -1 };
-        // SAFETY: as for `action` above.
-        let it = unsafe {
-            let it = NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm), &NSString::from_str(name), Some(sel!(setProject:)), &NSString::new());
-            it.setTarget(Some(&target));
-            it
-        };
-        it.setTag(tag);
-        project_menu.addItem(&it);
-        project_items.push((tag, it));
-    }
+    project_menu.setDelegate(Some(ProtocolObject::from_ref(&*target)));
     let project_parent = action("📁 目前專案", sel!(setProject:), "");
     project_parent.setSubmenu(Some(&project_menu));
 
@@ -927,18 +1003,19 @@ pub fn run(
         if *last != shown {
             project_line.setTitle(&NSString::from_str(&proj_text));
             project_line.setHidden(proj_text.is_empty());
-            let selected = manual.and_then(|m| project_names.iter().position(|n| n == m)).map_or(-1, |i| i as isize);
-            for (tag, it) in &project_items {
-                let on = if *tag == selected { NSControlStateValueOn } else { NSControlStateValueOff };
-                it.setState(on);
-            }
-            project_parent.setTitle(&NSString::from_str(&format!("📁 目前專案：{}", manual.unwrap_or("未指定"))));
+            let current = match (manual, state.manual_task.as_deref()) {
+                (_, Some(task)) => manual.map_or_else(|| task.to_owned(), |p| format!("{p} › {task}")),
+                (Some(p), None) => p.to_owned(),
+                (None, None) => "未指定".to_owned(),
+            };
+            project_parent.setTitle(&NSString::from_str(&format!("📁 目前：{current}")));
             line1.setTitle(&NSString::from_str(&state.lines[0]));
             line2.setTitle(&NSString::from_str(&state.lines[1]));
             goal_line.setTitle(&NSString::from_str(goal_text.as_deref().unwrap_or("")));
             goal_line.setHidden(goal_text.is_none());
             button.setToolTip(goal_text.as_deref().map(NSString::from_str).as_deref());
             *target.ivars().goal.borrow_mut() = state.goal.clone();
+            *target.ivars().manual.borrow_mut() = (state.manual_project.clone(), state.manual_task.clone());
             *last = shown;
         }
     });

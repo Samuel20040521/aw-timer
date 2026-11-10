@@ -24,7 +24,7 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn,
+    NSControlStateValueOff, NSControlStateValueOn, NSPopUpButton,
     NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontDescriptorSystemDesignSerif, NSFontWeightBold,
     NSFontWeightMedium, NSFontWeightRegular, NSFontWeightSemibold, NSForegroundColorAttributeName,
     NSLineBreakMode, NSLineCapStyle, NSLineJoinStyle, NSMenu, NSMenuItem, NSMutableParagraphStyle,
@@ -37,9 +37,10 @@ use objc2_foundation::{
 };
 
 use crate::calendar::{self, CalendarInfo, Denied, Event};
-use crate::categorize::{Kind, Override, UNCATEGORIZED};
+use crate::categorize::{Kind, Listed, Override, UNCATEGORIZED};
 use crate::claude_code::CodeIndex;
 use crate::client::AwClient;
+use crate::categorize::{ProjectRule, TaskRule};
 use crate::config;
 use crate::export::{self, Segment, day_start, logical_day};
 use crate::report::{self, Candidate};
@@ -128,12 +129,14 @@ pub struct DayView {
     segments: Vec<Segment>,
     /// Seconds per kind, indexed by `Kind::index`.
     totals: [f64; 4],
-    /// `(project, focus seconds, all seconds)` by descending focus.
-    projects: Vec<(String, f64, f64)>,
+    /// Projects (and loose tasks under an empty name) by descending focus.
+    projects: Vec<ProjectRow>,
     /// Longest focus stretch: `(start minute from 04:00, focused minutes)`.
     longest: Option<(f64, f64)>,
     uncategorized: Vec<Candidate>,
     events: Result<Vec<Event>, Denied>,
+    /// Project colours, stable across days (from all configured projects).
+    palette: HashMap<String, u32>,
 }
 
 impl DayView {
@@ -145,6 +148,17 @@ impl DayView {
         let a = self.active();
         if a > 0.0 { self.totals[Kind::Focus.index()] / a } else { 0.0 }
     }
+}
+
+/// Time of one project on the day, with its tasks.
+#[derive(Debug, Clone, PartialEq)]
+struct ProjectRow {
+    /// Empty for tasks that belong to no project.
+    name: String,
+    focus: f64,
+    all: f64,
+    /// `(task, focus seconds, all seconds)` by descending focus.
+    tasks: Vec<(String, f64, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +190,56 @@ pub struct Model {
     calendars: Option<Result<Vec<CalendarInfo>, Denied>>,
     /// Identifiers of calendars hidden from the timeline.
     hidden: BTreeSet<String>,
+    /// Projects and tasks; only loaded for the settings tab.
+    catalog: Option<Catalog>,
+}
+
+/// Every project and task, and which ones were added from this window
+/// (`projects.toml`, editable) rather than in `config.toml`.
+#[derive(Debug, Clone, Default)]
+pub struct Catalog {
+    projects: Vec<Listed>,
+    tasks: Vec<Listed>,
+    editable_projects: BTreeSet<String>,
+    editable_tasks: BTreeSet<String>,
+    palette: HashMap<String, u32>,
+}
+
+/// Plain keywords ("paper, QCE26") as a case-insensitive regex alternation.
+fn keywords_to_pattern(text: &str) -> Option<String> {
+    let words: Vec<String> = text
+        .split(['|', ',', '，', '、', ';', '；'])
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(regex::escape)
+        .collect();
+    (!words.is_empty()).then(|| words.join("|"))
+}
+
+/// A stored pattern as it is shown: keywords when it is a plain keyword
+/// list (as made by [`keywords_to_pattern`]), otherwise the regex itself.
+fn pattern_to_keywords(pattern: &str) -> String {
+    // Undo `regex::escape`, which only escapes non-alphanumeric characters.
+    let unescape = |w: &str| {
+        let mut out = String::new();
+        let mut chars = w.chars().peekable();
+        while let Some(c) = chars.next() {
+            match chars.peek() {
+                Some(&n) if c == '\\' && !n.is_alphanumeric() => {
+                    out.push(n);
+                    chars.next();
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    };
+    let words: Vec<String> = pattern.split('|').map(unescape).collect();
+    if keywords_to_pattern(&words.join(",")).as_deref() == Some(pattern) {
+        words.join("、")
+    } else {
+        format!("規則 {pattern}")
+    }
 }
 
 fn minutes(s: &Segment) -> f64 {
@@ -195,19 +259,36 @@ fn build_day(
     let in_day: Vec<Activity> = acts.iter().filter(|a| logical_day(a.start) == day).cloned().collect();
     let segments: Vec<Segment> = export::segments(acts.to_vec()).into_iter().filter(|s| s.day == key).collect();
     let mut totals = [0.0; 4];
-    let mut projects: HashMap<String, [f64; 2]> = HashMap::new();
+    // project -> ([focus, all], task -> [focus, all])
+    type FocusAll = [f64; 2];
+    let mut by_project: HashMap<String, (FocusAll, HashMap<String, FocusAll>)> = HashMap::new();
     for s in &segments {
-        totals[s.kind.index()] += minutes(s) * 60.0;
-        if !s.project.is_empty() && s.kind != Kind::Rest {
-            let e = projects.entry(s.project.clone()).or_default();
-            e[1] += minutes(s) * 60.0;
-            if s.kind == Kind::Focus {
-                e[0] += minutes(s) * 60.0;
-            }
+        let secs = minutes(s) * 60.0;
+        totals[s.kind.index()] += secs;
+        if (s.project.is_empty() && s.task.is_empty()) || s.kind == Kind::Rest {
+            continue;
+        }
+        let focus = if s.kind == Kind::Focus { secs } else { 0.0 };
+        let (sum, tasks) = by_project.entry(s.project.clone()).or_default();
+        sum[0] += focus;
+        sum[1] += secs;
+        if !s.task.is_empty() {
+            let t = tasks.entry(s.task.clone()).or_default();
+            t[0] += focus;
+            t[1] += secs;
         }
     }
-    let mut projects: Vec<(String, f64, f64)> = projects.into_iter().map(|(n, [f, a])| (n, f, a)).collect();
-    projects.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let by_focus = |a: &(String, f64, f64), b: &(String, f64, f64)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+    let mut projects: Vec<ProjectRow> = by_project
+        .into_iter()
+        .map(|(name, ([focus, all], tasks))| {
+            let mut tasks: Vec<(String, f64, f64)> = tasks.into_iter().map(|(n, [f, a])| (n, f, a)).collect();
+            tasks.sort_by(by_focus);
+            ProjectRow { name, focus, all, tasks }
+        })
+        .collect();
+    // Named projects by focus; loose tasks last.
+    projects.sort_by(|a, b| a.name.is_empty().cmp(&b.name.is_empty()).then(b.focus.total_cmp(&a.focus)).then_with(|| a.name.cmp(&b.name)));
 
     // Longest focus stretch: focus segments joined across gaps < max_gap_min.
     let mut longest: Option<(f64, f64)> = None;
@@ -234,7 +315,8 @@ fn build_day(
         .into_iter()
         .filter(|c| c.category == UNCATEGORIZED)
         .collect();
-    DayView { day, segments, totals, projects, longest, uncategorized, events }
+    let palette = palette(segments.iter().map(|s| s.project.as_str()));
+    DayView { day, segments, totals, projects, longest, uncategorized, events, palette }
 }
 
 /// Build the trends view for the period containing `day`.
@@ -412,13 +494,36 @@ impl Op {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CtrlKind {
     /// Classify candidate `row` of the day's uncategorized list.
     Classify(usize),
     Period,
     /// Show/hide calendar `i` of the settings list.
     Calendar(usize),
+    /// A text field of the add forms.
+    Input(Field),
+    /// The "which project" choice of the add-task form.
+    TaskProject,
+    /// A push button.
+    Button(Act),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Field {
+    ProjectName,
+    ProjectKeywords,
+    TaskName,
+    TaskKeywords,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Act {
+    AddProject,
+    AddTask,
+    /// Delete project `i` of the catalog (and its tasks).
+    DeleteProject(usize),
+    DeleteTask(usize),
 }
 
 /// A control to place at `frame`.
@@ -427,6 +532,8 @@ struct Ctrl {
     frame: NSRect,
     kind: CtrlKind,
     selected: Option<usize>,
+    /// Button title, field placeholder, or the choices of a pop-up.
+    text: Vec<String>,
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
@@ -575,8 +682,8 @@ fn pct(f: f64) -> String {
 }
 
 /// Project name -> colour, stable by name order.
-fn project_colors(segments: &[Segment]) -> HashMap<String, u32> {
-    let mut names: Vec<&str> = segments.iter().map(|s| s.project.as_str()).filter(|p| !p.is_empty()).collect();
+fn palette<'a>(names: impl Iterator<Item = &'a str>) -> HashMap<String, u32> {
+    let mut names: Vec<&str> = names.filter(|p| !p.is_empty()).collect();
     names.sort_unstable();
     names.dedup();
     names.iter().enumerate().map(|(i, n)| ((*n).to_owned(), PROJECT_COLORS[i % PROJECT_COLORS.len()])).collect()
@@ -673,7 +780,12 @@ fn layout_timeline(l: &mut Layout, d: &DayView, now_min: Option<f64>, x: f64, y:
         let (top, bottom) = (ty(s.start_min), ty(s.end_min));
         let r = rect(act_x, top, act_w, (bottom - top).max(1.0));
         l.fill(r, Ink::kind(s.kind), 0.0);
-        let project = if s.project.is_empty() { String::new() } else { format!(" [{}]", s.project) };
+        let project = match (s.project.is_empty(), s.task.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!(" [{}]", s.project),
+            (true, false) => format!(" [{}]", s.task),
+            (false, false) => format!(" [{} › {}]", s.project, s.task),
+        };
         l.tip(
             r,
             format!(
@@ -691,7 +803,7 @@ fn layout_timeline(l: &mut Layout, d: &DayView, now_min: Option<f64>, x: f64, y:
         l.text("這天沒有紀錄", act_x + 6.0, ty(30.0), act_w - 6.0, Font::Small, Ink::Secondary);
     }
     // Project lane: consecutive same-project segments < 5 min apart join.
-    let colors = project_colors(&d.segments);
+    let colors = &d.palette;
     let mut blocks: Vec<(String, f64, f64, f64, f64)> = Vec::new(); // name, start, end, focus, all
     for s in d.segments.iter().filter(|s| !s.project.is_empty()) {
         let f = if s.kind == Kind::Focus { minutes(s) } else { 0.0 };
@@ -707,7 +819,7 @@ fn layout_timeline(l: &mut Layout, d: &DayView, now_min: Option<f64>, x: f64, y:
     for (name, start, end, focus, all) in &blocks {
         let (top, bottom) = (ty(*start), ty(*end));
         let r = rect(proj_x, top, proj_w, (bottom - top).max(2.0));
-        l.fill(r, Ink::Rgb(colors[name], 1.0), 3.0);
+        l.fill(r, Ink::Rgb(colors.get(name).copied().unwrap_or(PROJECT_COLORS[0]), 1.0), 3.0);
         if bottom - top >= 16.0 {
             l.text(name.clone(), proj_x + 5.0, top + 1.0, proj_w - 8.0, Font::SmallBold, Ink::Rgb(0xffffff, 1.0));
         }
@@ -781,25 +893,36 @@ fn layout_totals(l: &mut Layout, d: &DayView, x: f64, y: f64, w: f64) -> f64 {
 }
 
 fn layout_projects(l: &mut Layout, d: &DayView, x: f64, y: f64, w: f64) -> f64 {
-    let rows = d.projects.len().max(1) as f64;
-    let h = 14.0 + 24.0 + 20.0 + rows * 26.0 + 10.0;
+    let (row_h, task_h) = (26.0, 22.0);
+    let tasks: usize = d.projects.iter().map(|p| p.tasks.len()).sum();
+    let body = if d.projects.is_empty() { row_h } else { d.projects.len() as f64 * row_h + tasks as f64 * task_h };
+    let h = 14.0 + 24.0 + 20.0 + body + 10.0;
     let (cx, cy, cw) = l.card(x, y, w, h);
-    l.text("專案", cx, cy, cw, Font::Heading, Ink::Label);
-    l.text("深色是專注，淺色是其他活動", cx, cy + 24.0, cw, Font::Small, Ink::Secondary);
+    l.text("專案與任務", cx, cy, cw, Font::Heading, Ink::Label);
+    l.text("深色是專注，淺色是其他活動；到「設定」可以新增專案和任務", cx, cy + 24.0, cw, Font::Small, Ink::Secondary);
     let mut ry = cy + 46.0;
     if d.projects.is_empty() {
-        l.text("這一天沒有歸到專案的時間。", cx, ry, cw, Font::Body, Ink::Tertiary);
+        l.text("這一天沒有歸到專案或任務的時間。", cx, ry, cw, Font::Body, Ink::Tertiary);
     }
-    let colors = project_colors(&d.segments);
-    let max_all = d.projects.iter().map(|p| p.2).fold(1.0, f64::max);
-    for (name, focus, all) in &d.projects {
-        let color = colors.get(name).copied().unwrap_or(PROJECT_COLORS[0]);
-        l.text(name.clone(), cx, ry, 80.0, Font::Bold, Ink::Label);
-        let bw = cw - 90.0 - 130.0;
-        l.fill(rect(cx + 90.0, ry + 4.0, (bw * all / max_all).max(4.0), 10.0), Ink::Rgb(color, 0.3), 3.0);
-        l.fill(rect(cx + 90.0, ry + 4.0, (bw * focus / max_all).max(2.0), 10.0), Ink::Rgb(color, 1.0), 3.0);
-        l.text_right(format!("{} / {}", fmt_duration(*focus), fmt_duration(*all)), cx + cw - 124.0, ry, 124.0, Font::Digits, Ink::Label);
-        ry += 26.0;
+    let colors = &d.palette;
+    let max_all = d.projects.iter().map(|p| p.all).fold(1.0, f64::max);
+    let (bx, bw) = (cx + 110.0, cw - 110.0 - 130.0);
+    for p in &d.projects {
+        let color = if p.name.is_empty() { NEUTRAL } else { colors.get(&p.name).copied().unwrap_or(PROJECT_COLORS[0]) };
+        let (name, ink) = if p.name.is_empty() { ("不屬於專案".to_owned(), Ink::Secondary) } else { (p.name.clone(), Ink::Label) };
+        l.text(name, cx, ry, 104.0, Font::Bold, ink);
+        l.fill(rect(bx, ry + 4.0, (bw * p.all / max_all).max(4.0), 10.0), Ink::Rgb(color, 0.3), 3.0);
+        l.fill(rect(bx, ry + 4.0, (bw * p.focus / max_all).max(2.0), 10.0), Ink::Rgb(color, 1.0), 3.0);
+        l.text_right(format!("{} / {}", fmt_duration(p.focus), fmt_duration(p.all)), cx + cw - 124.0, ry, 124.0, Font::Digits, Ink::Label);
+        ry += row_h;
+        for (task, focus, all) in &p.tasks {
+            l.text(format!("└ {task}"), cx + 12.0, ry, 98.0, Font::Small, Ink::Secondary);
+            l.tip(rect(cx + 12.0, ry, 98.0, 16.0), task.clone());
+            l.fill(rect(bx, ry + 5.0, (bw * all / max_all).max(3.0), 6.0), Ink::Rgb(color, 0.25), 2.0);
+            l.fill(rect(bx, ry + 5.0, (bw * focus / max_all).max(2.0), 6.0), Ink::Rgb(color, 0.8), 2.0);
+            l.text_right(format!("{} / {}", fmt_duration(*focus), fmt_duration(*all)), cx + cw - 124.0, ry, 124.0, Font::Small, Ink::Secondary);
+            ry += task_h;
+        }
     }
     y + h
 }
@@ -821,7 +944,7 @@ fn layout_uncategorized(l: &mut Layout, d: &DayView, x: f64, y: f64, w: f64) -> 
         let lw = cw - 56.0 - seg_w - 8.0;
         l.text(c.label.clone(), cx + 56.0, ry + 4.0, lw, Font::Body, Ink::Label);
         l.tip(rect(cx + 56.0, ry, lw, row_h - 4.0), c.label.clone());
-        l.ctrls.push(Ctrl { frame: rect(cx + cw - seg_w, ry, seg_w, 24.0), kind: CtrlKind::Classify(i), selected: None });
+        l.ctrls.push(Ctrl { frame: rect(cx + cw - seg_w, ry, seg_w, 24.0), kind: CtrlKind::Classify(i), selected: None, text: Vec::new() });
         if i + 1 < d.uncategorized.len() {
             l.fill(rect(cx + 56.0, ry + row_h - 4.0, cw - 56.0, 1.0), Ink::Grid, 0.0);
         }
@@ -837,7 +960,7 @@ fn layout_trends(l: &mut Layout, t: &TrendView, x: f64, y: f64, w: f64) -> f64 {
     let (cx, cy, cw) = l.card(x, y, w, h1);
     l.text("每週・每月・每年", cx, cy + 3.0, cw, Font::Heading, Ink::Label);
     let selected = Period::ALL.iter().position(|p| *p == t.period);
-    l.ctrls.push(Ctrl { frame: rect(cx + cw - 150.0, cy, 150.0, 24.0), kind: CtrlKind::Period, selected });
+    l.ctrls.push(Ctrl { frame: rect(cx + cw - 150.0, cy, 150.0, 24.0), kind: CtrlKind::Period, selected, text: Vec::new() });
     let span = match t.period {
         Period::Year => format!("{} 年", t.from.year()),
         _ => format!("{}/{}–{}/{}", t.from.month(), t.from.day(), t.to.month(), t.to.day()),
@@ -921,9 +1044,92 @@ fn layout_trends(l: &mut Layout, t: &TrendView, x: f64, y: f64, w: f64) -> f64 {
     y2 + h2
 }
 
-/// Settings: which calendars the timeline shows, grouped by account.
+/// Settings card: projects with their tasks, plus forms to add both.
+fn layout_catalog(l: &mut Layout, c: &Catalog, x: f64, y: f64, w: f64) -> f64 {
+    let (row_h, task_h) = (28.0, 26.0);
+    let loose: Vec<(usize, &Listed)> = c.tasks.iter().enumerate().filter(|(_, t)| t.project.is_none()).collect();
+    let list_h = c.projects.len() as f64 * row_h
+        + c.tasks.len() as f64 * task_h
+        + if loose.is_empty() { 0.0 } else { row_h };
+    let form_h = 2.0 * (22.0 + 34.0) + 36.0;
+    let h = 14.0 + 24.0 + 22.0 + list_h.max(row_h) + 12.0 + form_h + 10.0;
+    let (cx, cy, cw) = l.card(x, y, w, h);
+    l.text("專案與任務", cx, cy, cw, Font::Heading, Ink::Label);
+    l.text("任務可以放在專案底下，也可以單獨存在。", cx, cy + 24.0, cw, Font::Small, Ink::Secondary);
+    let mut ry = cy + 52.0;
+    if c.projects.is_empty() && c.tasks.is_empty() {
+        l.text("還沒有專案或任務，用下面的表單新增。", cx, ry, cw, Font::Body, Ink::Tertiary);
+        ry += row_h;
+    }
+    let del_w = 56.0;
+    let keywords = |pattern: &str| {
+        if pattern.is_empty() { "只能從選單手動選".to_owned() } else { format!("關鍵字：{}", pattern_to_keywords(pattern)) }
+    };
+    let task_row = |l: &mut Layout, i: usize, t: &Listed, ry: &mut f64| {
+        l.text(format!("└ {}", t.name), cx + 18.0, *ry + 3.0, 150.0, Font::Body, Ink::Label);
+        l.text(keywords(&t.pattern), cx + 174.0, *ry + 5.0, cw - 174.0 - del_w - 8.0, Font::Small, Ink::Secondary);
+        if c.editable_tasks.contains(&t.name) {
+            l.ctrls.push(Ctrl { frame: rect(cx + cw - del_w, *ry, del_w, 22.0), kind: CtrlKind::Button(Act::DeleteTask(i)), selected: None, text: vec!["刪除".into()] });
+        } else {
+            l.text_right("config.toml", cx + cw - 90.0, *ry + 5.0, 90.0, Font::Small, Ink::Tertiary);
+        }
+        *ry += task_h;
+    };
+    for (pi, p) in c.projects.iter().enumerate() {
+        let color = c.palette.get(&p.name).copied().unwrap_or(PROJECT_COLORS[0]);
+        l.fill(rect(cx + 1.0, ry + 7.0, 10.0, 10.0), Ink::Rgb(color, 1.0), 5.0);
+        l.text(p.name.clone(), cx + 18.0, ry + 3.0, 150.0, Font::Bold, Ink::Label);
+        l.text(keywords(&p.pattern), cx + 174.0, ry + 5.0, cw - 174.0 - del_w - 8.0, Font::Small, Ink::Secondary);
+        if c.editable_projects.contains(&p.name) {
+            l.ctrls.push(Ctrl { frame: rect(cx + cw - del_w, ry, del_w, 22.0), kind: CtrlKind::Button(Act::DeleteProject(pi)), selected: None, text: vec!["刪除".into()] });
+        } else {
+            l.text_right("config.toml", cx + cw - 90.0, ry + 5.0, 90.0, Font::Small, Ink::Tertiary);
+        }
+        ry += row_h;
+        for (i, t) in c.tasks.iter().enumerate().filter(|(_, t)| t.project.as_deref() == Some(p.name.as_str())) {
+            task_row(l, i, t, &mut ry);
+        }
+    }
+    if !loose.is_empty() {
+        l.text("不屬於專案的任務", cx, ry + 5.0, cw, Font::SmallBold, Ink::Secondary);
+        ry += row_h;
+        for (i, t) in loose {
+            task_row(l, i, t, &mut ry);
+        }
+    }
+    // Tasks whose project no longer exists still get listed, under nothing.
+    ry = ry.max(cy + 52.0 + list_h.max(row_h)) + 12.0;
+    l.fill(rect(cx, ry - 6.0, cw, 1.0), Ink::Grid, 0.0);
+
+    // Add forms.
+    let add_w = 64.0;
+    l.text("新增專案", cx, ry, cw, Font::SmallBold, Ink::Secondary);
+    ry += 22.0;
+    l.ctrls.push(Ctrl { frame: rect(cx, ry, 160.0, 24.0), kind: CtrlKind::Input(Field::ProjectName), selected: None, text: vec!["名稱".into()] });
+    l.ctrls.push(Ctrl { frame: rect(cx + 168.0, ry, cw - 168.0 - add_w - 8.0, 24.0), kind: CtrlKind::Input(Field::ProjectKeywords), selected: None, text: vec!["關鍵字（選填，用逗號分隔）".into()] });
+    l.ctrls.push(Ctrl { frame: rect(cx + cw - add_w, ry, add_w, 24.0), kind: CtrlKind::Button(Act::AddProject), selected: None, text: vec!["新增".into()] });
+    ry += 34.0;
+    l.text("新增任務", cx, ry, cw, Font::SmallBold, Ink::Secondary);
+    ry += 22.0;
+    let mut choices = vec!["不屬於專案".to_owned()];
+    choices.extend(c.projects.iter().map(|p| p.name.clone()));
+    l.ctrls.push(Ctrl { frame: rect(cx, ry, 140.0, 24.0), kind: CtrlKind::Input(Field::TaskName), selected: None, text: vec!["名稱".into()] });
+    l.ctrls.push(Ctrl { frame: rect(cx + 148.0, ry - 1.0, 150.0, 26.0), kind: CtrlKind::TaskProject, selected: Some(0), text: choices });
+    l.ctrls.push(Ctrl { frame: rect(cx + 306.0, ry, cw - 306.0 - add_w - 8.0, 24.0), kind: CtrlKind::Input(Field::TaskKeywords), selected: None, text: vec!["關鍵字（選填，用逗號分隔）".into()] });
+    l.ctrls.push(Ctrl { frame: rect(cx + cw - add_w, ry, add_w, 24.0), kind: CtrlKind::Button(Act::AddTask), selected: None, text: vec!["新增".into()] });
+    ry += 34.0;
+    l.text("有關鍵字的話，視窗標題或 App 名稱含有任一個就自動歸過去；沒有就從選單列「📁」手動選。", cx, ry, cw, Font::Small, Ink::Tertiary);
+    l.text("刪除專案會一併刪除它底下的任務。寫在 config.toml 的項目請直接改那個檔案。", cx, ry + 16.0, cw, Font::Small, Ink::Tertiary);
+    y + h
+}
+
+/// Settings: projects and tasks, then which calendars the timeline shows.
 fn layout_settings(l: &mut Layout, m: &Model, x: f64, y: f64, w: f64) -> f64 {
-    let w = w.min(640.0);
+    let w = w.min(720.0);
+    let y = match &m.catalog {
+        Some(c) => layout_catalog(l, c, x, y, w) + 16.0,
+        None => y,
+    };
     let row_h = 26.0;
     let cals = match &m.calendars {
         Some(Ok(c)) => c.as_slice(),
@@ -967,6 +1173,7 @@ fn layout_settings(l: &mut Layout, m: &Model, x: f64, y: f64, w: f64) -> f64 {
             frame: rect(cx + 20.0, ry, cw - 20.0, 22.0),
             kind: CtrlKind::Calendar(i),
             selected: Some(usize::from(shown)),
+            text: Vec::new(),
         });
         ry += row_h;
     }
@@ -1058,7 +1265,7 @@ struct Open {
     status: Retained<NSTextField>,
     tabs: Retained<NSSegmentedControl>,
     next: Retained<NSButton>,
-    ctrls: Vec<Retained<NSView>>,
+    ctrls: Vec<(CtrlKind, Retained<NSView>)>,
     /// Tooltip texts; AppKit does not retain a tooltip's owner.
     tips: Vec<Retained<NSString>>,
 }
@@ -1131,6 +1338,61 @@ define_class!(
                 self.ivars().period.set(p);
                 self.load();
             }
+        }
+
+        #[unsafe(method(addProject:))]
+        fn add_project(&self, _sender: Option<&AnyObject>) {
+            let name = self.form_text(Field::ProjectName);
+            let pattern = keywords_to_pattern(&self.form_text(Field::ProjectKeywords));
+            self.edit_projects(|file, cat| {
+                if name.is_empty() {
+                    return Err("請先輸入專案名稱".into());
+                }
+                if cat.projects().iter().any(|p| p.name == name) {
+                    return Err(format!("已經有叫「{name}」的專案"));
+                }
+                file.project.push(ProjectRule { name: name.clone(), paths: Vec::new(), pattern });
+                Ok(format!("已新增專案「{name}」"))
+            }, &[Field::ProjectName, Field::ProjectKeywords]);
+        }
+
+        #[unsafe(method(addTask:))]
+        fn add_task(&self, _sender: Option<&AnyObject>) {
+            let name = self.form_text(Field::TaskName);
+            let pattern = keywords_to_pattern(&self.form_text(Field::TaskKeywords));
+            let project = self.form_project();
+            self.edit_projects(|file, cat| {
+                if name.is_empty() {
+                    return Err("請先輸入任務名稱".into());
+                }
+                if cat.tasks().iter().any(|t| t.name == name) {
+                    return Err(format!("已經有叫「{name}」的任務"));
+                }
+                file.task.push(TaskRule { name: name.clone(), project: project.clone(), pattern });
+                Ok(match &project {
+                    Some(p) => format!("已在「{p}」底下新增任務「{name}」"),
+                    None => format!("已新增任務「{name}」"),
+                })
+            }, &[Field::TaskName, Field::TaskKeywords]);
+        }
+
+        #[unsafe(method(deleteProject:))]
+        fn delete_project(&self, sender: Option<&AnyObject>) {
+            let Some(name) = self.catalog_name(sender, true) else { return };
+            self.edit_projects(|file, _| {
+                file.project.retain(|p| p.name != name);
+                file.task.retain(|t| t.project.as_deref() != Some(name.as_str()));
+                Ok(format!("已刪除專案「{name}」"))
+            }, &[]);
+        }
+
+        #[unsafe(method(deleteTask:))]
+        fn delete_task(&self, sender: Option<&AnyObject>) {
+            let Some(name) = self.catalog_name(sender, false) else { return };
+            self.edit_projects(|file, _| {
+                file.task.retain(|t| t.name != name);
+                Ok(format!("已刪除任務「{name}」"))
+            }, &[]);
         }
 
         /// A calendar checkbox in settings changed; its tag indexes the list.
@@ -1218,10 +1480,20 @@ fn today() -> NaiveDate {
 /// Load one page on the calling (worker) thread.
 fn load_model(day: NaiveDate, tab: Tab, period: Period, config_path: Option<&str>, code: &Mutex<CodeIndex>) -> Loaded {
     let hidden = config::hidden_calendars();
-    if tab == Tab::Settings {
-        return Ok(Model { tab, day: None, trend: None, calendars: Some(calendar::calendars()), hidden });
-    }
     let (settings, mut cat, _) = config::load(config_path)?;
+    let colors = palette(cat.projects().iter().map(|p| p.name.as_str()));
+    if tab == Tab::Settings {
+        let file = config::load_projects()?;
+        let catalog = Catalog {
+            projects: cat.projects(),
+            tasks: cat.tasks(),
+            editable_projects: file.project.into_iter().map(|p| p.name).collect(),
+            editable_tasks: file.task.into_iter().map(|t| t.name).collect(),
+            palette: colors,
+        };
+        let calendars = Some(calendar::calendars());
+        return Ok(Model { tab, day: None, trend: None, calendars, hidden, catalog: Some(catalog) });
+    }
     let mut client = AwClient::new(&settings.server_url);
     let (from, to) = match tab {
         Tab::Trends => period.range(day),
@@ -1233,9 +1505,10 @@ fn load_model(day: NaiveDate, tab: Tab, period: Period, config_path: Option<&str
             .map_err(|e| format!("連不到 ActivityWatch（{e}）。請確認它有在執行。"))?;
     drop(code);
     let events = calendar::events(day_start(day), day_start(day + Duration::days(1)), &hidden);
-    let day_view = build_day(day, &acts, events, settings.max_interruption_min);
+    let mut day_view = build_day(day, &acts, events, settings.max_interruption_min);
+    day_view.palette = colors;
     let trend = (tab == Tab::Trends).then(|| build_trend(period, day, &acts));
-    Ok(Model { tab, day: Some(day_view), trend, calendars: None, hidden })
+    Ok(Model { tab, day: Some(day_view), trend, calendars: None, hidden, catalog: None })
 }
 
 impl ReportController {
@@ -1352,6 +1625,65 @@ impl ReportController {
         Open { window, scroll, doc, status, tabs, next, ctrls: Vec::new(), tips: Vec::new() }
     }
 
+    /// Trimmed text of a form field.
+    fn form_text(&self, field: Field) -> String {
+        let open = self.ivars().open.borrow();
+        open.as_ref()
+            .and_then(|o| o.ctrls.iter().find(|(k, _)| *k == CtrlKind::Input(field)))
+            .and_then(|(_, v)| v.downcast_ref::<NSTextField>().map(|f| f.stringValue().to_string()))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    /// The project chosen in the add-task form (`None` = no project).
+    fn form_project(&self) -> Option<String> {
+        let open = self.ivars().open.borrow();
+        let popup = open.as_ref()?.ctrls.iter().find(|(k, _)| *k == CtrlKind::TaskProject)?.1.downcast_ref::<NSPopUpButton>()?.retain();
+        drop(open);
+        (popup.indexOfSelectedItem() > 0).then(|| popup.titleOfSelectedItem().map(|t| t.to_string())).flatten()
+    }
+
+    /// Name of the catalog project (or task) whose delete button sent this.
+    fn catalog_name(&self, sender: Option<&AnyObject>, project: bool) -> Option<String> {
+        let i = usize::try_from(sender?.downcast_ref::<NSButton>()?.tag()).ok()?;
+        let data = self.ivars().data.borrow();
+        let c = data.as_ref()?.catalog.as_ref()?;
+        let list = if project { &c.projects } else { &c.tasks };
+        list.get(i).map(|l| l.name.clone())
+    }
+
+    /// Apply `change` to `projects.toml` (validated against everything
+    /// configured), save it, clear `fields` and reload the settings page.
+    fn edit_projects(
+        &self,
+        change: impl FnOnce(&mut config::ProjectsFile, &crate::categorize::Categorizer) -> Result<String, String>,
+        fields: &[Field],
+    ) {
+        let result = config::load(self.ivars().config_path.as_deref()).and_then(|(_, cat, _)| {
+            let mut file = config::load_projects()?;
+            let message = change(&mut file, &cat)?;
+            config::save_projects(&file)?;
+            Ok(message)
+        });
+        match result {
+            Ok(message) => {
+                if let Some(open) = self.ivars().open.borrow().as_ref() {
+                    for (kind, view) in &open.ctrls {
+                        if let (CtrlKind::Input(f), Some(t)) = (kind, view.downcast_ref::<NSTextField>())
+                            && fields.contains(f)
+                        {
+                            t.setStringValue(ns_string!(""));
+                        }
+                    }
+                }
+                self.load();
+                self.set_status(&message);
+            }
+            Err(e) => self.set_status(&e),
+        }
+    }
+
     fn go(&self, day: NaiveDate) {
         self.ivars().day.set(day);
         self.load();
@@ -1401,7 +1733,14 @@ impl ReportController {
             Ok(model) => {
                 iv.data.replace(Some(model));
                 iv.loaded_at.set(Some(Instant::now()));
-                self.set_status(&format!("更新於 {}", Local::now().format("%H:%M")));
+                if iv.tab.get() == Tab::Settings {
+                    // Keep a message an edit just set; clear "載入中…".
+                    if open_status_is_loading(iv) {
+                        self.set_status("");
+                    }
+                } else {
+                    self.set_status(&format!("更新於 {}", Local::now().format("%H:%M")));
+                }
             }
             Err(e) => {
                 iv.data.replace(None);
@@ -1451,8 +1790,16 @@ impl ReportController {
         let height = height.max(open.scroll.contentSize().height);
         open.doc.setFrameSize(NSSize::new(width, height));
         open.doc.ivars().ops.replace(lay.ops);
-        for c in open.ctrls.drain(..) {
-            c.removeFromSuperview();
+        // Keep what was typed into the forms across a re-layout.
+        let mut typed: HashMap<CtrlKind, String> = HashMap::new();
+        let mut picked: Option<isize> = None;
+        for (kind, view) in open.ctrls.drain(..) {
+            if let Some(f) = view.downcast_ref::<NSTextField>() {
+                typed.insert(kind, f.stringValue().to_string());
+            } else if let Some(p) = view.downcast_ref::<NSPopUpButton>() {
+                picked = Some(p.indexOfSelectedItem());
+            }
+            view.removeFromSuperview();
         }
         let target: &AnyObject = self;
         let cal_titles: Vec<String> = iv
@@ -1463,6 +1810,39 @@ impl ReportController {
             .unwrap_or_default();
         for c in lay.ctrls {
             let view: Retained<NSView> = match c.kind {
+                CtrlKind::Input(_) => {
+                    let f = NSTextField::initWithFrame(NSTextField::alloc(mtm), c.frame);
+                    if let Some(ph) = c.text.first() {
+                        f.setPlaceholderString(Some(&NSString::from_str(ph)));
+                    }
+                    if let Some(v) = typed.get(&c.kind) {
+                        f.setStringValue(&NSString::from_str(v));
+                    }
+                    Retained::into_super(Retained::into_super(f))
+                }
+                CtrlKind::TaskProject => {
+                    let p = NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), c.frame, false);
+                    for choice in &c.text {
+                        p.addItemWithTitle(&NSString::from_str(choice));
+                    }
+                    let n = c.text.len() as isize;
+                    p.selectItemAtIndex(picked.filter(|i| (0..n).contains(i)).unwrap_or(0));
+                    Retained::into_super(Retained::into_super(Retained::into_super(p)))
+                }
+                CtrlKind::Button(act) => {
+                    let (action, tag) = match act {
+                        Act::AddProject => (sel!(addProject:), 0),
+                        Act::AddTask => (sel!(addTask:), 0),
+                        Act::DeleteProject(i) => (sel!(deleteProject:), i as isize),
+                        Act::DeleteTask(i) => (sel!(deleteTask:), i as isize),
+                    };
+                    let title = NSString::from_str(c.text.first().map_or("", String::as_str));
+                    // SAFETY: `self` implements these actions and outlives the window.
+                    let b = unsafe { NSButton::buttonWithTitle_target_action(&title, Some(target), Some(action), mtm) };
+                    b.setTag(tag);
+                    b.setFrame(c.frame);
+                    Retained::into_super(Retained::into_super(b))
+                }
                 CtrlKind::Calendar(i) => {
                     let title = NSString::from_str(cal_titles.get(i).map_or("", String::as_str));
                     // SAFETY: `self` implements toggleCalendar: and outlives the window.
@@ -1497,7 +1877,7 @@ impl ReportController {
                 }
             };
             open.doc.addSubview(&view);
-            open.ctrls.push(view);
+            open.ctrls.push((c.kind, view));
         }
         open.doc.removeAllToolTips();
         open.tips.clear();
@@ -1512,6 +1892,10 @@ impl ReportController {
         drop(open_ref);
         self.update_header();
     }
+}
+
+fn open_status_is_loading(iv: &ControllerIvars) -> bool {
+    iv.open.borrow().as_ref().is_some_and(|o| o.status.stringValue().to_string() == "載入中…")
 }
 
 /// `aw-timer report -w`: show only the report window; quit when it closes.
@@ -1567,7 +1951,7 @@ mod tests {
         let (day, acts) = sample();
         let d = build_day(day, &acts, Ok(Vec::new()), 5.0);
         assert!((d.totals[Kind::Focus.index()] - 2400.0).abs() < 7.0);
-        assert_eq!(d.projects[0].0, "CVSD");
+        assert_eq!(d.projects[0].name, "CVSD");
         assert_eq!(d.uncategorized.len(), 1);
         assert!((d.longest.unwrap().1 - 40.0).abs() < 0.2);
     }
@@ -1581,6 +1965,7 @@ mod tests {
             trend: None,
             calendars: None,
             hidden: BTreeSet::new(),
+            catalog: None,
         };
         for width in [MIN_W, 1200.0] {
             let (l, height) = layout(&model, width, None);
@@ -1608,6 +1993,36 @@ mod tests {
     }
 
     #[test]
+    fn keywords_become_an_escaped_alternation() {
+        assert_eq!(keywords_to_pattern("paper, QCE26、a.b"), Some(r"paper|QCE26|a\.b".to_owned()));
+        assert_eq!(keywords_to_pattern(" , "), None);
+        assert_eq!(pattern_to_keywords(r"paper|a\.b"), "paper、a.b");
+        assert_eq!(pattern_to_keywords(r"\bvcs\b|verilog"), r"規則 \bvcs\b|verilog");
+    }
+
+    #[test]
+    fn catalog_lists_tasks_under_projects_with_delete_only_for_editable() {
+        let listed = |name: &str, project: Option<&str>| Listed { name: name.into(), project: project.map(Into::into), pattern: String::new() };
+        let catalog = Catalog {
+            projects: vec![listed("CVSD", None), listed("IBM-QAE", None)],
+            tasks: vec![listed("HW3", Some("CVSD")), listed("Paper", Some("IBM-QAE")), listed("Errands", None)],
+            editable_projects: BTreeSet::from(["IBM-QAE".to_owned()]),
+            editable_tasks: BTreeSet::from(["Paper".to_owned(), "Errands".to_owned()]),
+            palette: HashMap::new(),
+        };
+        let mut l = Layout::default();
+        layout_catalog(&mut l, &catalog, 0.0, 0.0, 700.0);
+        let deletes: Vec<Act> = l.ctrls.iter().filter_map(|c| match c.kind {
+            CtrlKind::Button(a @ (Act::DeleteProject(_) | Act::DeleteTask(_))) => Some(a),
+            _ => None,
+        }).collect();
+        assert_eq!(deletes, vec![Act::DeleteProject(1), Act::DeleteTask(1), Act::DeleteTask(2)]);
+        assert_eq!(l.ctrls.iter().filter(|c| matches!(c.kind, CtrlKind::Input(_))).count(), 4);
+        let popup = l.ctrls.iter().find(|c| c.kind == CtrlKind::TaskProject).unwrap();
+        assert_eq!(popup.text, vec!["不屬於專案", "CVSD", "IBM-QAE"]);
+    }
+
+    #[test]
     fn settings_lists_one_checkbox_per_calendar_with_hidden_unchecked() {
         let cal = |id: &str, source: &str| CalendarInfo { id: id.into(), title: id.into(), source: source.into(), color: 0x3366cc };
         let model = Model {
@@ -1616,6 +2031,7 @@ mod tests {
             trend: None,
             calendars: Some(Ok(vec![cal("a", "iCloud"), cal("b", "iCloud"), cal("c", "Google")])),
             hidden: BTreeSet::from(["b".to_owned()]),
+            catalog: None,
         };
         let (l, _) = layout(&model, 900.0, None);
         let checks: Vec<Option<usize>> =
