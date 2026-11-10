@@ -6,6 +6,9 @@
 set -euo pipefail
 
 BIN="${1:?usage: check-bundle.sh <path to aw-timer>}"
+# Absolute, so that running "${BIN}" never searches PATH (a bare
+# "aw-timer" would be looked up there, not in the current directory).
+BIN="$(cd "$(dirname "${BIN}")" && pwd)/$(basename "${BIN}")"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT

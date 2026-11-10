@@ -6,6 +6,9 @@
 set -euo pipefail
 
 BIN="${1:?usage: check-binary.sh <path to aw-timer>}"
+# Absolute, so that running "${BIN}" never searches PATH (a bare
+# "aw-timer" would be looked up there, not in the current directory).
+BIN="$(cd "$(dirname "${BIN}")" && pwd)/$(basename "${BIN}")"
 
 # Every architecture slice must target macOS 11.0.
 minos="$(otool -l "${BIN}" | grep -A3 LC_BUILD_VERSION | awk '/minos/ {print $2}' | sort -u)"
